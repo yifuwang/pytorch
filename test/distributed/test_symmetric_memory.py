@@ -153,6 +153,42 @@ class SymmetricMemoryTest(MultiProcessTestCase):
 
         self._verify_symmetric_memory(symm_mem_0)
 
+
+    @skipIfRocm
+    @skip_if_lt_x_gpu(2)
+    def test_cuda_graph(self) -> None:
+        self._init_process()
+
+        shape = (64, 64)
+        stride = (64, 1)
+        dtype = torch.float32
+        device = self.device
+        group_name = "0"
+        alloc_args = (shape, stride, dtype, device, group_name)
+
+        t = _SymmetricMemory.empty_strided_p2p(*alloc_args)
+
+        # TODO: allocation should also work
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            symm_mem = _SymmetricMemory.rendezvous(t)
+            symm_mem.barrier()
+
+            buf = symm_mem.get_buffer(0, (64, 64), torch.float32)
+            if symm_mem.rank == 0:
+                symm_mem.wait_signal(src_rank=1)
+            else:
+                buf.fill_(42)
+                symm_mem.put_signal(dst_rank=0)
+
+            symm_mem.barrier()
+
+        for _ in range(10):
+            g.replay()
+            if symm_mem.rank == 0:
+                self.assertTrue(buf.eq(42).all())
+                buf.fill_(0)
+
     @skipIfRocm
     @skip_if_lt_x_gpu(2)
     @parametrize("gather_dim", [0, 1])
