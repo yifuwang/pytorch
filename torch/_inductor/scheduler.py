@@ -1155,6 +1155,7 @@ class ForeachKernelSchedulerNode(FusedSchedulerNode):
 
     @classmethod
     def can_fuse(cls, producer: BaseSchedulerNode, consumer: BaseSchedulerNode) -> bool:
+        return False
         why = WhyNoFuse(producer, consumer)
         if producer.is_foreach() and consumer.is_foreach():
             producer = typing.cast(ForeachKernelSchedulerNode, producer)
@@ -2335,6 +2336,8 @@ class Scheduler:
         Determine if it is possible to combine node1 and node2 into a
         single fused node.
         """
+
+        return False
 
         if node1 is node2:
             return False

@@ -213,6 +213,11 @@ def fuse_all_gather_matmul(match, shard, gather_dim, group_name):
             A_shard, [B_0, B_1, B_2, ...], gather_dim, group_name,
         )
     """
+    if _is_backward(shard.graph):
+        # print(f"shard_name: {shard}")
+        if "add" in str(shard):
+            return
+
     if (
         not torch.distributed.is_available()
         or not torch.distributed.is_nccl_available()
@@ -308,6 +313,9 @@ def fuse_matmul_reduce_scatter(match, rs_input, reduce_op, scatter_dim, group_na
             A, B, scatter_dim, group_name,
         )
     """
+    if _is_backward(rs_input.graph):
+        return
+
     if (
         not torch.distributed.is_available()
         or not torch.distributed.is_nccl_available()

@@ -99,15 +99,44 @@ def raise_comms_and_sink_waits(
         if len(deps) == 0:
             heapq.heappush(ready, Runnable(snode))
 
-    scheduled = []
-    while len(ready):
-        curr = heapq.heappop(ready).snode
-        scheduled.append(curr)
-        for scheduler_buf in curr.get_outputs():
+    def foo():
+        readable = []
+        for x in ready:
+            node = x.snode.node
+            if isinstance(node, ir.ExternKernelOut):
+                readable.append(node.python_kernel_name)
+            else:
+                readable.append(type(node))
+        return readable
+
+
+    def is_mm(snode):
+        return isinstance(snode.node, ir.ExternKernelOut) and snode.node.python_kernel_name == "extern_kernels.mm"
+
+
+    def schedule(snode):
+        scheduled.append(snode)
+        for scheduler_buf in snode.get_outputs():
             for snode in buf_name_to_downstream_ops[scheduler_buf.get_name()]:
                 snode_num_deps[snode] -= 1
                 if snode_num_deps[snode] == 0:
                     heapq.heappush(ready, Runnable(snode))
+
+
+    scheduled = []
+    while len(ready):
+        curr = heapq.heappop(ready).snode
+        if is_wait(curr.node):
+            print(f"Ready queue when scheduling a wait {foo()}")
+            for _ in range(1):
+                for i in range(len(ready)):
+                    if is_mm(ready[i].snode):
+                        x = ready.pop(i)
+                        schedule(x.snode)
+                        break
+            heapq.heapify(ready)
+                    
+        schedule(curr)
 
     for snode, num_deps in snode_num_deps.items():
         assert num_deps == 0, "Unscheduled nodes"
