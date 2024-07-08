@@ -6355,9 +6355,10 @@ try:
     def _all_gather_into_tensor(inp, group_size, group_name):
         return ir.TensorBox.create(
             ir._CollectiveKernel.create_out_of_place(
-                _c10d_functional.all_gather_into_tensor.default,
+                # _c10d_functional.all_gather_into_tensor.default,
+                torch.ops.symm_mem.all_gather.default,
                 inp,
-                group_size,
+                # group_size,
                 group_name,
             )
         )
@@ -6378,10 +6379,11 @@ try:
     def _reduce_scatter_tensor(inp, reduce_op, group_size, group_name):
         return ir.TensorBox.create(
             ir._CollectiveKernel.create_out_of_place(
-                _c10d_functional.reduce_scatter_tensor.default,
+                # _c10d_functional.reduce_scatter_tensor.default,
+                torch.ops.symm_mem.one_shot_reduce_scatter.default,
                 inp,
                 reduce_op,
-                group_size,
+                # group_size,
                 group_name,
             )
         )

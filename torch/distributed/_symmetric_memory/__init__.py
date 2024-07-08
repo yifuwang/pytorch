@@ -255,6 +255,108 @@ lib.define(
 lib.define(
     "fused_matmul_reduce_scatter(Tensor A, Tensor B, str reduce_op, int scatter_dim, str group_name) -> Tensor"
 )
+lib.define(
+    "one_shot_reduce_scatter(Tensor tensor, str reduce_op, str group_name) -> Tensor"
+)
+lib.define(
+    "all_gather(Tensor tensor, str group_name) -> Tensor"
+)
+
+
+@torch.library.impl(lib, "one_shot_reduce_scatter", "Meta")
+def _one_shot_reduce_scatter_meta(
+    tensor: torch.Tensor,
+    reduce_op: str,
+    group_name: str,
+) -> torch.Tensor:
+    group_size = c10d._get_group_size_by_name(group_name)
+    return tensor.unflatten(0, (group_size, -1)).mean(dim=0)
+
+
+from torch._C._distributed_c10d import Work as _Work
+
+
+class Work(_Work):
+    def __init__(self):
+        super().__init__()
+        self.event = torch.cuda.Event()
+        self.event.record()
+
+    def wait(self, *args) -> bool:
+        self.event.wait()
+        return True
+
+
+@torch.library.impl(lib, "one_shot_reduce_scatter", "CUDA")
+def one_shot_reduce_scatter(
+    tensor: torch.Tensor,
+    reduce_op: str,
+    group_name: str,
+    # async_op: bool,
+) -> torch.Tensor:
+    symm_mem = get_symm_mem_workspace(group_name, tensor.numel() * tensor.element_size())
+    rank = symm_mem.rank
+    world_size = symm_mem.world_size
+
+    assert tensor.shape[0] % world_size == 0
+    chunks = tensor.chunk(world_size)
+
+    _get_backend_stream().wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(_get_backend_stream()):
+        # push + offline reduction
+        symm_mem.barrier()
+        for step in range(0, world_size):
+            remote_rank = (rank - step) % world_size
+            dst_buf = symm_mem.get_buffer(
+                remote_rank, chunks[0].shape, chunks[0].dtype, chunks[0].numel() * rank
+            )
+            dst_buf.copy_(chunks[remote_rank])
+        symm_mem.barrier()
+
+        buf = symm_mem.get_buffer(rank, tensor.shape, tensor.dtype)
+        ret = buf.unflatten(0, (world_size, -1)).mean(dim=0)
+        torch._C._distributed_c10d._register_work(ret, Work())
+        return ret
+
+
+@torch.library.impl(lib, "all_gather", "Meta")
+def _all_gather(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    group_size = c10d._get_group_size_by_name(group_name)
+    return tensor.new_empty(tensor.shape[0] * group_size, *tensor.shape[1:])
+
+
+@torch.library.impl(lib, "all_gather", "CUDA")
+def _all_gather(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> torch.Tensor:
+    symm_mem = get_symm_mem_workspace(group_name, tensor.numel() * tensor.element_size())
+    rank = symm_mem.rank
+    world_size = symm_mem.world_size
+
+    output = tensor.new_empty(tensor.shape[0] * world_size, *tensor.shape[1:])
+    chunks = output.chunk(world_size)
+
+    _get_backend_stream().wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(_get_backend_stream()):
+        local_buf = symm_mem.get_buffer(
+            rank, tensor.shape, tensor.dtype
+        )
+        local_buf.copy_(tensor)
+        # pull
+        symm_mem.barrier()
+        for step in range(0, world_size):
+            remote_rank = (rank - step) % world_size
+            src_buf = symm_mem.get_buffer(
+                remote_rank, tensor.shape, tensor.dtype
+            )
+            chunks[remote_rank].copy_(src_buf)
+        symm_mem.barrier()
+        torch._C._distributed_c10d._register_work(output, Work())
+        return output
 
 
 @torch.library.impl(lib, "fused_all_gather_matmul", "Meta")

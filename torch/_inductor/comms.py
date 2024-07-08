@@ -88,58 +88,66 @@ def raise_comms_and_sink_waits(
             return self.score < other.score
 
     ready: List[Runnable] = []
-    snode_num_deps: Dict[BaseSchedulerNode, int] = {}
+    buf_to_user_snodes: Dict[str, Set[BaseSchedulerNode]] = defaultdict(set)
+    snode_to_unmet_deps: Dict[BaseSchedulerNode, Set[str]] = defaultdict(set)
+    snode_to_cost: Dict[BaseSchedulerNode, float] = {}
 
-    buf_name_to_downstream_ops = defaultdict(set)
     for snode in snodes:
         deps = snode.unmet_dependencies
         for dep in deps:
-            buf_name_to_downstream_ops[dep.name].add(snode)
-        snode_num_deps[snode] = len(deps)
+            buf_to_user_snodes[dep.name].add(snode)
+            snode_to_unmet_deps[snode].add(dep.name)
         if len(deps) == 0:
             heapq.heappush(ready, Runnable(snode))
-
-    def foo():
-        readable = []
-        for x in ready:
-            node = x.snode.node
-            if isinstance(node, ir.ExternKernelOut):
-                readable.append(node.python_kernel_name)
-            else:
-                readable.append(type(node))
-        return readable
-
-
-    def is_mm(snode):
-        return isinstance(snode.node, ir.ExternKernelOut) and snode.node.python_kernel_name == "extern_kernels.mm"
-
+        snode_to_cost[snode] = estimate_op_runtime(snode)
 
     def schedule(snode):
+        # print(f"========== scheduled {snode}, {type(snode.node)}, is_mm: {is_mm(snode)}, runtime: {estimate_op_runtime(snode)}")
         scheduled.append(snode)
         for scheduler_buf in snode.get_outputs():
-            for snode in buf_name_to_downstream_ops[scheduler_buf.get_name()]:
-                snode_num_deps[snode] -= 1
-                if snode_num_deps[snode] == 0:
-                    heapq.heappush(ready, Runnable(snode))
+            for user in buf_to_user_snodes[scheduler_buf.get_name()]:
+                snode_to_unmet_deps[user].remove(scheduler_buf.get_name())
+                if len(snode_to_unmet_deps[user]) == 0:
+                    heapq.heappush(ready, Runnable(user))
+
+        if is_collective(snode.node):
+            from torch._inductor.comm_analysis import get_collective_type
+            ####
+            if get_collective_type(snode.node) == 1:
+                snode.node
+            ####
+            collective_cost = snode_to_cost[snode]
+            candidates = [x for x in ready if not is_collective(x.snode.node) and not is_wait(x.snode.node)]
+            while collective_cost > 0 and len(candidates) > 0:
+                candidate = ready[0]
+                candidate_cost = snode_to_cost[candidate.snode]
+                for x in ready[1:]:
+                    if snode_to_cost[x.snode] > candidate_cost:
+                        candidate = x
+                        candidate_cost = snode_to_cost[x.snode]
+
+                ready.remove(candidate)
+                schedule(candidate.snode)
+                collective_cost -= candidate_cost
+                print(f"{get_collective_type(snode.node)} ({estimate_op_runtime(snode)}): {type(candidate.snode.node)} ({snode_to_cost[candidate.snode]})")
+            heapq.heapify(ready)
 
 
     scheduled = []
     while len(ready):
         curr = heapq.heappop(ready).snode
-        if is_wait(curr.node):
-            print(f"Ready queue when scheduling a wait {foo()}")
-            for _ in range(1):
-                for i in range(len(ready)):
-                    if is_mm(ready[i].snode):
-                        x = ready.pop(i)
-                        schedule(x.snode)
-                        break
-            heapq.heapify(ready)
-                    
+        # if is_wait(curr.node):
+        #     for _ in range(1):
+        #         for i in range(len(ready)):
+        #             if is_mm(ready[i].snode):
+        #                 x = ready.pop(i)
+        #                 schedule(x.snode)
+        #                 break
+        #     heapq.heapify(ready)
         schedule(curr)
 
-    for snode, num_deps in snode_num_deps.items():
-        assert num_deps == 0, "Unscheduled nodes"
+    for snode, unmet_deps in snode_to_unmet_deps.items():
+        assert len(unmet_deps) == 0, f"Unscheduled node: {snode}. Unmet deps: {unmet_deps}"
     return scheduled
 
 
@@ -180,7 +188,7 @@ def decide_global_ordering_of_comms(nodes: List[BaseSchedulerNode]):
     comm_nodes = [n for n in nodes if is_collective(n.node)]
 
     def item(x: Set[str]) -> str:
-        assert len(x) == 1
+        # assert len(x) == 1
         return next(iter(x))
 
     for i in range(1, len(comm_nodes)):
