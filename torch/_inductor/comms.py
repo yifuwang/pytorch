@@ -117,10 +117,10 @@ def raise_comms_and_sink_waits(
     def schedule(snode):
         scheduled.append(snode)
         for scheduler_buf in snode.get_outputs():
-            for snode in buf_name_to_downstream_ops[scheduler_buf.get_name()]:
-                snode_num_deps[snode] -= 1
-                if snode_num_deps[snode] == 0:
-                    heapq.heappush(ready, Runnable(snode))
+            for user in buf_name_to_downstream_ops[scheduler_buf.get_name()]:
+                snode_num_deps[user] -= 1
+                if snode_num_deps[user] == 0:
+                    heapq.heappush(ready, Runnable(user))
 
 
     scheduled = []
