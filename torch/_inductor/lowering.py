@@ -6377,7 +6377,8 @@ try:
 
     @register_lowering(_c10d_functional.reduce_scatter_tensor)
     def _reduce_scatter_tensor(inp, reduce_op, group_size, group_name):
-        return ir.TensorBox.create(
+        # return ir.TensorBox.create(
+        res = ir.TensorBox.create(
             ir._CollectiveKernel.create_out_of_place(
                 # _c10d_functional.reduce_scatter_tensor.default,
                 torch.ops.symm_mem.one_shot_reduce_scatter.default,
@@ -6387,6 +6388,7 @@ try:
                 group_name,
             )
         )
+        return mean(_wait_tensor(res), axis=0)
 
     @register_lowering(_c10d_functional.reduce_scatter_tensor_coalesced)
     def _reduce_scatter_tensor_coalesced(inputs, reduce_op, group_size, group_name):
