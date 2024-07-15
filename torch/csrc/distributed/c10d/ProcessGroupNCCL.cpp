@@ -957,6 +957,23 @@ void ProcessGroupNCCL::performNocolorSplit(at::Device device) {
 #endif
 }
 
+void ProcessGroupNCCL::registerUserBuffer(void* ptr, size_t size) {
+  if (useTensorRegisterAllocatorHook_) {
+    return;
+  }
+  for (auto& [buf, sz] : userBuffers_) {
+    TORCH_CHECK(
+        reinterpret_cast<uintptr_t>(ptr) + size <=
+            reinterpret_cast<uintptr_t>(buf) ||
+        reinterpret_cast<uintptr_t>(buf) + sz <=
+            reinterpret_cast<uintptr_t>(ptr));
+  }
+  userBuffers_.emplace(ptr, size);
+  for (auto& [ncclComm, _] : ncclCommDevIdxMap) {
+    ncclComm->registerSegment(ptr, size);
+  }
+}
+
 c10::intrusive_ptr<intra_node_comm::IntraNodeComm> ProcessGroupNCCL::
     initIntraNodeComm() {
   using IntraNodeComm = intra_node_comm::IntraNodeComm;
@@ -2227,6 +2244,9 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::getNCCLComm(
             reinterpret_cast<void*>(segmentInfo.address),
             segmentInfo.total_size);
       }
+    }
+    for (auto& [buf, sz] : userBuffers_) {
+      ncclComm->registerSegment(buf, sz);
     }
     // Record the mapping between ncclComm and device index so that later
     // register hook can register a newly allocated segment to communicators

@@ -24,6 +24,7 @@
 #endif
 
 #ifdef USE_C10D_NCCL
+#include <torch/csrc/cuda/nccl.h>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
 #include <torch/csrc/distributed/c10d/intra_node_comm.hpp>
@@ -895,6 +896,41 @@ This class does not support ``__members__`` property.)");
           py::arg("factor").noconvert(),
           py::return_value_policy::copy, // seems safest
           py::call_guard<py::gil_scoped_release>());
+
+  module.def(
+      "_empty_strided_nccl",
+      [](c10::IntArrayRef size,
+         c10::IntArrayRef stride,
+         c10::ScalarType dtype,
+         c10::Device device,
+         c10::intrusive_ptr<::c10d::ProcessGroup> group) {
+        auto backend = group->getBackend(c10::DeviceType::CUDA);
+        auto nccl_pg =
+            dynamic_cast<::c10d::ProcessGroupNCCL*>(backend.get());
+        TORCH_CHECK(backend != nullptr);
+
+        const size_t numel = std::accumulate(
+            size.begin(), size.end(), 1, std::multiplies<int>());
+        const size_t element_size = c10::elementSize(dtype);
+        const size_t alloc_size = numel * element_size;
+
+        void* ptr = nullptr;
+        c10::cuda::CUDAGuard g(device.index());
+        TORCH_CHECK_EQ(ncclMemAlloc(&ptr, alloc_size), 0);
+        nccl_pg->registerUserBuffer(ptr, alloc_size);
+
+        auto options = at::TensorOptions().dtype(dtype).device(device);
+        // return at::from_blob(
+        //     ptr,
+        //     size,
+        //     stride,
+        //     [](void* ptr) { ncclMemFree(ptr); },
+        //     options);
+        return at::for_blob(ptr, size)
+            .options(options)
+            .target_device(device)
+            .make_tensor();
+      });
 
   module.def(
       "_set_thread_isolation_mode",

@@ -476,6 +476,7 @@ class NCCLComm {
             " on ncclComm_ ",
             ncclComm_));
     registeredSegmentHandles_[ptr] = handle;
+    LOG(INFO) << "registered segment";
     return ncclSuccess;
 #else
     return ncclInvalidUsage;

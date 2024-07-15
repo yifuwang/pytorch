@@ -670,6 +670,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
 
   void performNocolorSplit(at::Device device);
 
+  void registerUserBuffer(void* ptr, size_t size);
+
  protected:
   // Helper that broadcasts nccl unique ID to all ranks through the store
   void broadcastUniqueNCCLID(
@@ -1112,6 +1114,8 @@ class TORCH_API ProcessGroupNCCL : public Backend {
   int localDeviceCount_{0};
 
   ProcessGroupStatus pgStatus_;
+
+  std::map<void*, size_t> userBuffers_;
 };
 
 // Dumps the NCCL comm traces and additional information about the Process
