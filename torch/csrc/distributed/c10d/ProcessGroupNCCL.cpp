@@ -968,8 +968,12 @@ void ProcessGroupNCCL::registerUserBuffer(void* ptr, size_t size) {
         reinterpret_cast<uintptr_t>(buf) + sz <=
             reinterpret_cast<uintptr_t>(ptr));
   }
+  // TORCH_CHECK(ptr != nullptr);
   userBuffers_.emplace(ptr, size);
+
+  std::lock_guard<std::mutex> lock(ncclCommDevIdxMapMutex);
   for (auto& [ncclComm, _] : ncclCommDevIdxMap) {
+    LOG(INFO) << "registering from registerUserBuffer";
     ncclComm->registerSegment(ptr, size);
   }
 }
@@ -2245,6 +2249,7 @@ std::shared_ptr<NCCLComm> ProcessGroupNCCL::getNCCLComm(
             segmentInfo.total_size);
       }
     }
+    LOG(INFO) << "registering from getNCCLComm";
     for (auto& [buf, sz] : userBuffers_) {
       ncclComm->registerSegment(buf, sz);
     }

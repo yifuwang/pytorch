@@ -465,7 +465,13 @@ class NCCLComm {
         " has already been registered on ncclComm_ ",
         ncclComm_);
 
+    if (ptr == nullptr) {
+      LOG(INFO) << "registerSegment got nullptr";
+      return ncclSuccess;
+    }
+
     void* handle;
+    LOG(INFO) << "registering " << ptr << ": " << size;
     C10D_NCCL_CHECK(
         ncclCommRegister(ncclComm_, ptr, size, &handle),
         c10::str(

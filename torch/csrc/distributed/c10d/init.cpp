@@ -910,13 +910,15 @@ This class does not support ``__members__`` property.)");
         TORCH_CHECK(backend != nullptr);
 
         const size_t numel = std::accumulate(
-            size.begin(), size.end(), 1, std::multiplies<int>());
+            size.begin(), size.end(), 1, std::multiplies<int64_t>());
         const size_t element_size = c10::elementSize(dtype);
         const size_t alloc_size = numel * element_size;
 
         void* ptr = nullptr;
         c10::cuda::CUDAGuard g(device.index());
+        LOG(INFO) << "device.index(): " << int(device.index());
         TORCH_CHECK_EQ(ncclMemAlloc(&ptr, alloc_size), 0);
+        LOG(INFO) << "after ncclMemAlloc: " << ptr << ", " << alloc_size;
         nccl_pg->registerUserBuffer(ptr, alloc_size);
 
         auto options = at::TensorOptions().dtype(dtype).device(device);
@@ -926,6 +928,7 @@ This class does not support ``__members__`` property.)");
         //     stride,
         //     [](void* ptr) { ncclMemFree(ptr); },
         //     options);
+        LOG(INFO) << "_empty_strided_nccl device: " << device;
         return at::for_blob(ptr, size)
             .options(options)
             .target_device(device)
