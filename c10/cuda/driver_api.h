@@ -29,6 +29,12 @@
   _(cuMemGetAllocationGranularity)  \
   _(cuMemExportToShareableHandle)   \
   _(cuMemImportFromShareableHandle) \
+  _(cuDeviceGetAttribute)           \
+  _(cuStreamWriteValue32_v2)           \
+  _(cuStreamWaitValue32_v2)            \
+  _(cuPointerGetAttribute)           \
+  _(cuStreamWaitValue64_v2)            \
+  _(cuMemGetAccess)            \
   _(cuGetErrorString)
 
 #define C10_NVML_DRIVER_API(_)           \

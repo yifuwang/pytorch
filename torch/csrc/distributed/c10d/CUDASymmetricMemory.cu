@@ -365,13 +365,57 @@ static __global__ void barrier_kernel(
 
 void CUDASymmetricMemory::barrier(int channel) {
   check_channel(channel, world_size_);
-  c10::cuda::CUDAGuard guard(local_device_idx_);
-  barrier_kernel<<<1, C10_WARP_SIZE, 0, at::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<uint32_t**>(signal_pads_dev_),
-      channel,
-      rank_,
-      world_size_);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+  auto driver_api = c10::cuda::DriverAPI::get();
+
+  int canUseStreamMemOps = 0;
+  int canUse64BitStreamMemOps = 0;
+  C10_CUDA_DRIVER_CHECK(
+      driver_api->cuDeviceGetAttribute_(&canUseStreamMemOps, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, 0));
+  C10_CUDA_DRIVER_CHECK(
+      driver_api->cuDeviceGetAttribute_(&canUse64BitStreamMemOps, CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS, 0));
+  LOG(INFO) << "CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1: " << canUseStreamMemOps;
+  LOG(INFO) << "CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS: " << canUse64BitStreamMemOps;
+
+  auto haha = at::zeros({1}, at::TensorOptions().dtype(at::kInt).device(at::kCUDA, local_device_idx_));
+
+  auto good = reinterpret_cast<CUdeviceptr>(
+      reinterpret_cast<uint32_t*>(haha.data_ptr<int>()));
+  auto bad = reinterpret_cast<CUdeviceptr>(
+      reinterpret_cast<uint32_t*>(signal_pads_[rank_]));
+
+
+  bool syncMemopsGood, syncMemopsBad;
+  C10_CUDA_DRIVER_CHECK(driver_api->cuPointerGetAttribute_(&syncMemopsGood, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, good));
+  C10_CUDA_DRIVER_CHECK(driver_api->cuPointerGetAttribute_(&syncMemopsBad, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS, bad));
+  LOG(INFO) << "CU_POINTER_ATTRIBUTE_SYNC_MEMOPS: " << syncMemopsGood << " vs " << syncMemopsBad;
+
+  // C10_CUDA_DRIVER_CHECK(driver_api->cuStreamWaitValue32_v2_(
+  //   static_cast<CUstream>(at::cuda::getCurrentCUDAStream().stream()),
+  //   addr,
+  //   42,
+  //   CU_STREAM_WAIT_VALUE_EQ));
+
+    // CU_STREAM_WAIT_VALUE_EQ));
+  // for (int r = 0; r < world_size_; ++r) {
+  //   // if (r == rank_) {
+  //   //   continue;
+  //   // }
+  //   auto addr = reinterpret_cast<CUdeviceptr>(
+  //       static_cast<uint32_t*>(signal_pads_[rank_]));
+  //   // LOG(INFO) << "cuStreamWaitValue32_";
+  //   C10_CUDA_DRIVER_CHECK(driver_api->cuStreamWaitValue32_v2_(
+  //     static_cast<CUstream>(at::cuda::getCurrentCUDAStream().stream()),
+  //     addr,
+  //     0,
+  //     CU_STREAM_WAIT_VALUE_GEQ));
+  //     // CU_STREAM_WAIT_VALUE_EQ));
+  //   // driver_api->cuStreamWriteValue32_(
+  //   //   at::cuda::getCurrentCUDAStream().stream(),
+  //   //   addr,
+  //   //   1,
+  //   //   0);
+  // }
 }
 
 static __global__ void put_signal_kernel(
@@ -442,6 +486,7 @@ void* CUDASymmetricMemoryAllocator::alloc(
   // NOLINTNEXTLINE(bugprone-signed-char-misuse)
   prop.location.id = device_idx;
   prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+  prop.allocFlags.gpuDirectRDMACapable = 1;
 
   size_t signal_pad_offset = at::round_up(size, 16UL);
   size_t block_size = signal_pad_offset + signal_pad_size;
