@@ -635,3 +635,14 @@ def micro_pipeline_tp_pass(graph: torch.fx.Graph):
 
     for reduce_scatter in reduce_scatters:
         fuse_matmul_reduce_scatter(reduce_scatter)
+
+
+def annotate_collective_impl_selection(graph: torch.fx.Graph):
+    from torch.distributed._symmetric_memory import is_symm_mem_enabled_for_group
+
+    unexposed_collectives = _get_unexposed_collectives(graph)
+    for node in unexposed_collectives:
+        group_name = node.args[-1]
+        assert isinstance(group_name, str)
+        if is_symm_mem_enabled_for_group(group_name):
+            node.meta["use_low_contention_collective"] = True

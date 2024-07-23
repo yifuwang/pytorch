@@ -492,6 +492,9 @@ _fuse_ddp_communication_passes: List[Union[Callable[..., None], str]] = [
     "schedule_comm_wait",
 ]
 
+# Whether to 
+_collective_impl_selection: bool = False
+
 _micro_pipeline_tp: bool = False
 
 
