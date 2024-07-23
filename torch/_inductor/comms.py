@@ -206,7 +206,7 @@ def _schedule_for_comm(
 
     while len(ready):
         snode = heapq.heappop(ready).snode
-        if reorder_for_overlap and is_collective(snode.node):
+        if reorder_for_overlap and is_collective(snode.node) and "all_reduce" not in str(snode.node.python_kernel_name):
             schedule_collective_for_overlap(snode)
         else:
             schedule(snode)

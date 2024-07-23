@@ -590,9 +590,14 @@ def _get_unexposed_collectives(graph: torch.fx.Graph) -> List[torch.fx.Node]:
     """
 
     def _is_compute_intensive(node: torch.fx.Node) -> bool:
-        return node.target in [torch.ops.aten.mm.default]
+        return node.target in [
+            torch.ops.aten.mm.default,
+            torch.ops.aten._scaled_mm.default,
+        ]
 
     collective_to_overlapping_candidates = defaultdict(list)
+    for x, y in collective_to_overlapping_candidates:
+        print("=============", x, y)
     available_nodes = set()
     collective_to_overlappable_nodes = _get_collective_to_overlappable_nodes(graph)
     for collective, overlappable_nodes in collective_to_overlappable_nodes.items():
@@ -641,6 +646,7 @@ def annotate_collective_impl_selection(graph: torch.fx.Graph):
     from torch.distributed._symmetric_memory import is_symm_mem_enabled_for_group
 
     unexposed_collectives = _get_unexposed_collectives(graph)
+    print(f"annotating: {unexposed_collectives}")
     for node in unexposed_collectives:
         group_name = node.args[-1]
         assert isinstance(group_name, str)
