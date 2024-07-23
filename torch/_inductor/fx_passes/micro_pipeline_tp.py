@@ -98,28 +98,61 @@ def find_all_gather_patterns(graph: torch.fx.Graph):
         ),
     )
 
+    zero_dim_all_gather_split_pattern = CallFunction(
+        operator.getitem,
+        CallFunction(
+            aten.split.Tensor,
+            zero_dim_all_gather_pattern,
+            Ignored(),
+            _users=MULTIPLE,
+        ),
+        Ignored(),
+    )
+
     # Matches funcol.all_gather_tensor with gather_dim > 0
     non_zero_dim_all_gather_pattern = CallFunction(
         aten.cat.default,
         ListOf(
-            CallFunction(
-                operator.getitem,
-                CallFunction(
-                    aten.split.Tensor,
-                    zero_dim_all_gather_pattern,
-                    Ignored(),
-                    _users=MULTIPLE,
-                ),
-                Ignored(),
-            ),
+            zero_dim_all_gather_split_pattern,
         ),
         KeywordArg("gather_dim"),
+    )
+
+    # Matches a non-zero dim all-gather pattern where the data is transferred
+    # as uint8 and viewed back to the original dtype.
+    non_zero_dim_type_erased_all_gather_pattern = CallFunction(
+        aten.view.dtype,
+        CallFunction(
+            aten.cat.default,
+            ListOf(
+                CallFunction(
+                    aten.view.dtype,
+                    zero_dim_all_gather_split_pattern,
+                    Ignored(),
+                ),
+            ),
+            KeywordArg("gather_dim"),
+        ),
+        Ignored(),
     )
 
     all_gathers = []
     visited_waits = set()
     for node in reversed(graph.nodes):
-        if node.target == aten.cat.default:
+        if node.target == aten.view.dtype:
+            if match := non_zero_dim_type_erased_all_gather_pattern.match(node):
+                assert isinstance(match, Match)
+                ag_match = _AllGatherMatch(
+                    match=match,
+                    shard_node=match.kwargs["shard"],
+                    ag_node=match.nodes[0],
+                    res_node=node,
+                    gather_dim=match.kwargs["gather_dim"],
+                    group_name=match.kwargs["group_name"],
+                )
+                visited_waits.add(match.nodes[1])
+                all_gathers.append(ag_match)
+        elif node.target == aten.cat.default:
             if match := non_zero_dim_all_gather_pattern.match(node):
                 assert isinstance(match, Match)
                 ag_match = _AllGatherMatch(

@@ -4,11 +4,13 @@ import unittest
 import torch
 import torch.distributed as dist
 from functorch import make_fx
+from torch._inductor.decomposition import decompositions
 from torch._inductor.fx_passes.micro_pipeline_tp import (
-    _get_overlappable_collectives,
+    _get_unexposed_collectives,
     find_all_gather_patterns,
     find_reduce_scatter_patterns,
 )
+from torch._inductor.fx_passes.post_grad import remove_noop_ops, view_to_reshape
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_triton_code
 from torch.distributed._functional_collectives import (
     all_gather_tensor,
@@ -31,6 +33,13 @@ from torch.testing._internal.common_utils import (  # type: ignore[attr-defined]
 from torch.testing._internal.distributed._tensor.common_dtensor import MLPModule
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torch.utils._triton import has_triton
+
+
+def _make_post_grad_fx(f, *inps):
+    gm = make_fx(f, decompositions)(*inps)
+    remove_noop_ops(gm.graph)
+    view_to_reshape(gm)
+    return gm
 
 
 @instantiate_parametrized_tests
@@ -61,21 +70,24 @@ class MicroPipelineTPTest(TestCase):
         def func(inp: torch.Tensor) -> torch.Tensor:
             a = all_gather_tensor(inp, gather_dim=0, group=group.group_name)
             b = all_gather_tensor(inp, gather_dim=1, group=group.group_name)
-            return a, b
+
+            c = all_gather_tensor(
+                inp.view(torch.uint8), gather_dim=0, group=group.group_name
+            )
+            chunks = c.chunk(self.world_size)
+            chunks = [chunk.view(torch.uint8) for chunk in chunks]
+            c = torch.cat(chunks, dim=1).view(torch.bfloat16)
+            return a, b, c
 
         inp = torch.rand(64, 32, device="cuda")
 
-        gm = make_fx(func)(inp)
+        gm = _make_post_grad_fx(func, inp)
         all_gathers = find_all_gather_patterns(gm.graph)
-        self.assertEqual(len(all_gathers), 2)
+        self.assertEqual(len(all_gathers), 3)
 
         # If this test fails, please update find_all_gather_patterns instead of
         # modifying the following assertions.
         for all_gather in all_gathers:
-            self.assertEqual(
-                all_gather.shard_node.op,
-                "placeholder",
-            )
             self.assertEqual(
                 all_gather.ag_node.target,
                 torch.ops._c10d_functional.all_gather_into_tensor.default,
@@ -92,6 +104,12 @@ class MicroPipelineTPTest(TestCase):
         self.assertEqual(
             all_gathers[1].res_node.target,
             torch.ops.aten.cat.default,
+        )
+
+        self.assertEqual(all_gathers[2].gather_dim, 1)
+        self.assertEqual(
+            all_gathers[2].res_node.target,
+            torch.ops.aten.view.dtype,
         )
 
     @unittest.skipIf(not has_triton(), "Inductor+gpu needs triton and recent GPU arch")
@@ -152,7 +170,7 @@ class MicroPipelineTPTest(TestCase):
         inp = torch.rand(64, 32, device="cuda")
 
         gm = make_fx(func)(inp)
-        overlappable_collectives = _get_overlappable_collectives(gm.graph)
+        overlappable_collectives = _get_unexposed_collectives(gm.graph)
         self.assertEqual(
             list(map(str, overlappable_collectives)),
             ["all_gather_into_tensor", "reduce_scatter_tensor"],
