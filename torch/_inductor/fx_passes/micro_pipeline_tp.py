@@ -1,8 +1,8 @@
 # mypy: allow-untyped-defs
 import operator
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import cast, Dict, List, Set, Tuple, Union
+from dataclasses import dataclass, field
+from typing import cast, Dict, List, Set, Tuple
 
 import torch
 from .. import config, inductor_prims
@@ -264,23 +264,20 @@ def find_reduce_scatter_patterns(graph: torch.fx.Graph):
 
 
 @dataclass
-class _2DMatmul:
-    node: torch.fx.Node
-    B_node: torch.fx.Node
-    B_node_ancestors: Set[torch.fx.Node]
-
-    def replace_with(self, new_node: torch.fx.Node) -> None:
-        """
-        Replace the matmul with the new node.
-        """
-        self.node.replace_all_uses_with(new_node)
-
-
-@dataclass
-class _NDMatmul:
+class _Matmul:
     nodes: List[torch.fx.Node]
+    arg_ancestor_nodes: Set[torch.fx.Node] = field(init=False)
     B_node: torch.fx.Node
-    B_node_ancestors: Set[torch.fx.Node]
+
+    def __post_init__(self):
+        assert len(self.nodes) in (1, 3)
+        if len(self.nodes) == 1:
+            assert self.nodes[0].target == aten.mm.default
+        else:
+            assert self.nodes[0].target == aten.reshape.default
+            assert self.nodes[1].target in (aten.mm.default, aten._scaled_mm.default)
+            assert self.nodes[2].target == aten.reshape.default
+        self.arg_ancestor_nodes = _find_ancestors(self.B_node)
 
     def replace_with(self, new_node: torch.fx.Node) -> None:
         """
@@ -293,11 +290,21 @@ class _NDMatmul:
         users by replacing it with a reverse reshape of `new_node`.
         """
         graph = new_node.graph
+
+        if len(self.nodes) == 1:
+            mm_node = self.nodes[0]
+            assert mm_node.target in (aten.mm.default, aten._scaled_mm.default)
+            mm_node.replace_all_uses_with(new_node)
+            graph.erase_node(mm_node)
+            return
+
+        # TODO: erase
+        graph = new_node.graph
         assert len(self.nodes) == 3
         mm_node = self.nodes[1]
         output_reshape_node = self.nodes[2]
 
-        assert mm_node.target == aten.mm.default
+        assert mm_node.target in (aten.mm.default, aten._scaled_mm.default)
         assert output_reshape_node.target == aten.reshape.default
 
         output_reshape_node.replace_all_uses_with(new_node)
@@ -310,61 +317,127 @@ class _NDMatmul:
             mm_node.replace_all_uses_with(new_mm_node)
 
 
-def _find_consumer_matmuls(node: torch.fx.Node) -> List[Union[_2DMatmul, _NDMatmul]]:
+@dataclass
+class _ScaledMatmul(_Matmul):
+    A_scale_node: torch.fx.Node
+    B_scale_node: torch.fx.Node
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.arg_ancestor_nodes |= _find_ancestors(self.A_scale_node)
+        self.arg_ancestor_nodes |= _find_ancestors(self.B_scale_node)
+
+
+def _parse_reshape_mm_reshape(node: torch.fx.Node) -> List[_Matmul]:
+    if node.target != aten.reshape.default:
+        return []
+
+    matches = []
+    for mm_node in node.users:
+        if mm_node.target not in (aten.mm.default, aten._scaled_mm.default):
+            continue
+        for reshape_node in mm_node.users:
+            if reshape_node.target != aten.reshape.default:
+                continue
+
+            matmul_input_node = cast(torch.fx.Node, node.args[0])
+            B_node = cast(torch.fx.Node, mm_node.args[1])
+            matmul_out_shape = torch.Size(
+                [
+                    *_get_tensor(matmul_input_node).shape[:-1],
+                    _get_tensor(B_node).shape[-1],
+                ]
+            )
+            if _get_tensor(reshape_node).shape != matmul_out_shape:
+                continue
+            matches.append([node, mm_node, reshape_node])
+            # If for some rare reason mm_node is being reshaped by two
+            # different reshape nodes, we only include mm_node once in the
+            # parsing result.
+            break
+
+    matmuls = []
+    for match in matches:
+        mm_node = match[1]
+        if mm_node.target == aten.mm.default:
+            matmul = _Matmul(
+                nodes=match,
+                B_node=cast(torch.fx.Node, mm_node.args[1]),
+            )
+            if node in matmul.arg_ancestor_nodes:
+                continue
+            matmuls.append(matmul)
+        elif mm_node.target == aten._scaled_mm.default:
+            matmul = _ScaledMatmul(
+                nodes=match,
+                B_node=cast(torch.fx.Node, mm_node.args[1]),
+                A_scale_node=cast(torch.fx.Node, mm_node.args[2]),
+                B_scale_node=cast(torch.fx.Node, mm_node.args[3]),
+            )
+            if node in matmul.arg_ancestor_nodes:
+                continue
+            matmuls.append(matmul)
+        else:
+            raise AssertionError(
+                "Expect the node's target to be either aten.mm.default or "
+                f"aten._scaled_mm.default. Got {mm_node.target}."
+            )
+    return matmuls
+
+
+def _find_consumer_matmuls(node: torch.fx.Node) -> List[_Matmul]:
     """
     Find the matmuls that use `node` as the lhs argument.
     This function effective normalizes 2D and ND matmuls.
     """
-    matmuls: List[Union[_2DMatmul, _NDMatmul]] = []
-
+    matmuls = []
     for user in node.users:
         # ND matmuls
         if user.target == aten.reshape.default:
-            for mm_node in user.users:
-                if mm_node.target != aten.mm.default:
-                    continue
-
-                B_node = mm_node.args[1]
-                assert isinstance(B_node, torch.fx.Node)
-                can_schedule, B_node_ancestors = _can_schedule_y_before_x(user, B_node)
-                if not can_schedule:
-                    continue
-
-                for reshape_node in mm_node.users:
-                    if reshape_node.target != aten.reshape.default:
-                        continue
-
-                    matmul_out_shape = torch.Size(
-                        [
-                            *_get_tensor(node).shape[:-1],
-                            _get_tensor(B_node).shape[-1],
-                        ]
-                    )
-                    if _get_tensor(reshape_node).shape != matmul_out_shape:
-                        continue
-
-                    matmuls.append(
-                        _NDMatmul(
-                            nodes=[user, mm_node, reshape_node],
-                            B_node=B_node,
-                            B_node_ancestors=B_node_ancestors,
-                        )
-                    )
+            matmuls.extend(_parse_reshape_mm_reshape(user))
         # 2D matmuls
         elif user.target == aten.mm.default:
-            B_node = cast(torch.fx.Node, user.args[1])
-            can_schedule, B_node_ancestors = _can_schedule_y_before_x(user, B_node)
-            if not can_schedule:
+            matmul = _Matmul(nodes=[user], B_node=cast(torch.fx.Node, user.args[1]))
+            if user in matmul.arg_ancestor_nodes:
                 continue
-
-            matmuls.append(
-                _2DMatmul(
-                    node=user,
-                    B_node=B_node,
-                    B_node_ancestors=B_node_ancestors,
-                ),
-            )
+            matmuls.append(matmul)
     return matmuls
+
+
+def _insert_fused_all_gather_matmul(
+    graph: torch.fx.Graph,
+    matmuls: List[_Matmul],
+    shard_node: torch.fx.Node,
+    gather_dim: int,
+    group_name: str,
+) -> torch.fx.Node:
+    mm_types = set(map(type, matmuls))
+    assert len(mm_types) == 1
+    mm_type = next(iter(mm_types))
+    if mm_type == _Matmul:
+        B_nodes = [matmul.B_node for matmul in matmuls]
+        return graph.call_function(
+            torch.ops.symm_mem.fused_all_gather_matmul.default,
+            args=(shard_node, B_nodes, gather_dim, group_name),
+        )
+    elif mm_type == _ScaledMatmul:
+        scaled_matmuls = cast(List[_ScaledMatmul], matmuls)
+        B_nodes = [matmul.B_node for matmul in scaled_matmuls]
+        A_scale_node = scaled_matmuls[0].A_scale_node
+        B_scale_nodes = [matmul.B_scale_node for matmul in scaled_matmuls]
+        return graph.call_function(
+            torch.ops.symm_mem.fused_all_gather_scaled_matmul.default,
+            args=(
+                shard_node,
+                B_nodes,
+                A_scale_node,
+                B_scale_nodes,
+                gather_dim,
+                group_name,
+            ),
+        )
+    else:
+        raise AssertionError(f"Unexpected matmul match type: {mm_type}")
 
 
 def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
@@ -412,10 +485,8 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
 
     # Find consumer matmuls for eligible for fusion
     matmuls = _find_consumer_matmuls(ag_res_node)
-    if len(matmuls) == 0:
+    if len(matmuls) == 0 or len(set(map(type, matmuls))) != 1:
         return
-
-    B_nodes = [matmul.B_node for matmul in matmuls]
 
     # Fuse the all_gather_tensor with the eligible matmuls
     graph = ag_node.graph
@@ -430,9 +501,8 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
                 args=(shard_node, restrided.stride()),
             )
 
-        fused_node = graph.call_function(
-            torch.ops.symm_mem.fused_all_gather_matmul.default,
-            args=(shard_node, B_nodes, gather_dim, group_name),
+        fused_node = _insert_fused_all_gather_matmul(
+            graph, matmuls, shard_node, gather_dim, group_name
         )
         new_ag_node = graph.call_function(
             operator.getitem,
@@ -450,12 +520,13 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
             matmul.replace_with(new_out_node)
         ag_res_node.replace_all_uses_with(new_ag_node)
 
+    # TODO: update
     # Raise ancestors of B that are topologically ordered between ag_res_node
     # and the matmul above fused_node. _find_consumer_matmuls guarantees that
     # ag_res_node is not an ancestor of B.
     order = {node: idx for idx, node in enumerate(graph.nodes)}
     nodes_to_raise = sorted(
-        {x for matmul in matmuls for x in matmul.B_node_ancestors},
+        {x for matmul in matmuls for x in matmul.arg_ancestor_nodes},
         key=lambda x: order[x],
     )
     for node in nodes_to_raise:
