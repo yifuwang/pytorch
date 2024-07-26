@@ -2,7 +2,7 @@
 import operator
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import cast, Dict, List, Optional, Set, Tuple
+from typing import cast, Dict, List, Optional, Set
 
 import torch
 from .. import config, inductor_prims
@@ -466,9 +466,12 @@ def _insert_fused_all_gather_matmul(
                 B_nodes,
                 A_scale_node,
                 B_scale_nodes,
-                out_dtypes,
                 gather_dim,
                 group_name,
+                [],
+                [],
+                out_dtypes,
+                [],
             ),
         )
     else:

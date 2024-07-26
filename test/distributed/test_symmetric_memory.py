@@ -223,25 +223,31 @@ class SymmetricMemoryTest(MultiProcessTestCase):
             torch.rand(N, K, device="cuda").to(torch.float8_e4m3fn).T for _ in range(3)
         ]
         B_scales = [torch.tensor(0.1, device="cuda") for _ in range(3)]
-        output_dtypes = [None, torch.bfloat16, torch.float32]
+        out_dtypes = [None, torch.bfloat16, torch.float32]
 
-        ag_output_1, mm_outputs_1 = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
-            A_shard,
-            Bs,
-            A_scale,
-            B_scales,
-            output_dtypes,
-            gather_dim=gather_dim,
-            group_name=group.group_name,
-        )
         ag_output_0, mm_outputs_0 = _fused_all_gather_scaled_matmul_fallback(
             A_shard,
             Bs,
             A_scale,
             B_scales,
-            output_dtypes,
             gather_dim=gather_dim,
             group_name=group.group_name,
+            biases=[],
+            result_scales=[],
+            out_dtypes=out_dtypes,
+            use_fast_accum=[],
+        )
+        ag_output_1, mm_outputs_1 = torch.ops.symm_mem.fused_all_gather_scaled_matmul(
+            A_shard,
+            Bs,
+            A_scale,
+            B_scales,
+            gather_dim=gather_dim,
+            group_name=group.group_name,
+            biases=[],
+            result_scales=[],
+            out_dtypes=out_dtypes,
+            use_fast_accum=[],
         )
 
         self.assertTrue(
@@ -333,7 +339,6 @@ class SymmetricMemoryTest(MultiProcessTestCase):
             group_name=group.group_name,
         )
 
-        print(output_0, output_1)
         assert torch.allclose(output_0, output_1)
         assert output_0.stride() == output_1.stride()
 

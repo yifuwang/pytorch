@@ -259,7 +259,11 @@ lib.define(
 lib.define(
     "fused_all_gather_scaled_matmul("
     "Tensor A, Tensor[] Bs, Tensor A_scale, Tensor[] B_scales, "
-    "ScalarType?[] out_dtypes, int gather_dim, str group_name) -> (Tensor, Tensor[])"
+    "int gather_dim, str group_name, "
+    "Tensor?[] biases, "
+    "Tensor?[] result_scales, "
+    "ScalarType?[] out_dtypes, "
+    "bool[] use_fast_accum) -> (Tensor, Tensor[])"
 )
 lib.define(
     "fused_matmul_reduce_scatter(Tensor A, Tensor B, str reduce_op, int scatter_dim, str group_name) -> Tensor"
@@ -609,9 +613,12 @@ def _fused_all_gather_scaled_matmul_fallback(
     Bs: List[torch.Tensor],
     A_scale: torch.Tensor,
     B_scales: List[torch.Tensor],
-    out_dtypes: List[Optional[torch.dtype]],
     gather_dim: int,
     group_name: str,
+    biases: List[Optional[torch.Tensor]],
+    result_scales: List[Optional[torch.Tensor]],
+    out_dtypes: List[Optional[torch.dtype]],
+    use_fast_accum: List[Optional[torch.dtype]],
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     out_dtypes = _maybe_convert_scalar_types_to_dtypes(out_dtypes)
 
@@ -647,9 +654,12 @@ def _fused_all_gather_scaled_matmul(
     Bs: List[torch.Tensor],
     A_scale: torch.Tensor,
     B_scales: List[torch.Tensor],
-    out_dtypes: List[Optional[torch.dtype]],
     gather_dim: int,
     group_name: str,
+    biases: List[Optional[torch.Tensor]],
+    result_scales: List[Optional[torch.Tensor]],
+    out_dtypes: List[Optional[torch.dtype]],
+    use_fast_accum: List[Optional[torch.dtype]],
 ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
     """
     Perform the following logic with micro-pipelined computation and
@@ -668,7 +678,16 @@ def _fused_all_gather_scaled_matmul(
 
     if _is_test_mode:
         return _fused_all_gather_scaled_matmul_fallback(
-            A_shard, Bs, A_scale, B_scales, out_dtypes, gather_dim, group_name
+            A_shard,
+            Bs,
+            A_scale,
+            B_scales,
+            gather_dim,
+            group_name,
+            biases,
+            result_scales,
+            out_dtypes,
+            use_fast_accum,
         )
     if A_shard.dim() < 2:
         raise ValueError("A_shard must be a matrix")
