@@ -69,6 +69,14 @@ class _AllGatherMatch:
     gather_dim: int
     group_name: str
 
+    def replace_with(self, new_node: torch.fx.Node) -> None:
+        self.res_node.replace_all_uses_with(new_node)
+
+    def erase(self) -> None:
+        for node in reversed(self.match.nodes):
+            assert len(node.users) == 0
+            node.graph.erase_node(node)
+
 
 def find_all_gather_patterns(graph: torch.fx.Graph):
     c10d = torch.ops._c10d_functional
@@ -197,6 +205,14 @@ class _ReduceScatterMatch:
     scatter_dim: int
     group_name: str
 
+    def replace_with(self, new_node: torch.fx.Node) -> None:
+        self.res_node.replace_all_uses_with(new_node)
+
+    def erase(self) -> None:
+        for node in reversed(self.match.nodes):
+            assert len(node.users) == 0
+            node.graph.erase_node(node)
+
 
 def find_reduce_scatter_patterns(graph: torch.fx.Graph):
     c10d = torch.ops._c10d_functional
@@ -319,6 +335,11 @@ class _Matmul:
                     args=(new_node, list(_get_tensor(mm_node).shape)),
                 )
             mm_node.replace_all_uses_with(new_mm_node)
+
+    def erase(self) -> None:
+        for node in reversed(self.nodes):
+            if len(node.users) == 0:
+                node.graph.erase_node(node)
 
     @classmethod
     def from_match(cls, match: List[torch.fx.Node]) -> "_Matmul":
@@ -565,7 +586,9 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
                 args=(new_out_nodes, idx),
             )
             matmul.replace_with(new_out_node)
-        ag_res_node.replace_all_uses_with(new_ag_node)
+            matmul.erase()
+        all_gather.replace_with(new_ag_node)
+        all_gather.erase()
 
     # Raise ancestors of non-A args that are topologically ordered between
     # ag_res_node and the matmul above fused_node.
@@ -577,9 +600,6 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
     for node in nodes_to_raise:
         if order[node] > order[fused_node]:
             fused_node.prepend(node)
-
-    graph.eliminate_dead_code()
-    return
 
 
 def _find_producer_matmul(node: torch.fx.Node) -> Optional[_Matmul]:
@@ -709,7 +729,9 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch) -> None:
             scatter_dim,
             group_name,
         )
-        rs_res_node.replace_all_uses_with(fused_node)
+        reduce_scatter.replace_with(fused_node)
+        reduce_scatter.erase()
+        matmul.erase()
 
     order = {node: idx for idx, node in enumerate(graph.nodes)}
     nodes_to_raise = sorted(
@@ -719,8 +741,6 @@ def fuse_matmul_reduce_scatter(reduce_scatter: _ReduceScatterMatch) -> None:
     for node in nodes_to_raise:
         if order[node] > order[fused_node]:
             fused_node.prepend(node)
-
-    graph.eliminate_dead_code()
 
 
 def _get_node_to_ancestors(
