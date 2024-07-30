@@ -47,6 +47,9 @@ class CUDASymmetricMemory : public SymmetricMemory {
   int get_rank() override;
   int get_world_size() override;
 
+  at::Tensor matmul_reduce_scatter(
+      at::Tensor& a, at::Tensor& b, at::Tensor& workspace) override;
+
  private:
   std::vector<HandleType> handles_;
   size_t block_size_;

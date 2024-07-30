@@ -651,3 +651,199 @@ static RegisterCUDASymmetricMemoryAllocator register_allocator_;
 
 } // namespace symmetric_memory
 } // namespace c10d
+
+#include <ATen/Dispatch.h>
+#include <ATen/core/Tensor.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+
+static CUresult CUDAAPI nvrtc_cuTensorMapEncodeTiled(
+    CUtensorMap* tensorMap,
+    CUtensorMapDataType tensorDataType,
+    cuuint32_t tensorRank,
+    void* globalAddress,
+    const cuuint64_t* globalDim,
+    const cuuint64_t* globalStrides,
+    const cuuint32_t* boxDim,
+    const cuuint32_t* elementStrides,
+    CUtensorMapInterleave interleave,
+    CUtensorMapSwizzle swizzle,
+    CUtensorMapL2promotion l2Promotion,
+    CUtensorMapFloatOOBfill oobFill) {
+  return at::globalContext().getNVRTC().cuTensorMapEncodeTiled(
+      tensorMap,
+      tensorDataType,
+      tensorRank,
+      globalAddress,
+      globalDim,
+      globalStrides,
+      boxDim,
+      elementStrides,
+      interleave,
+      swizzle,
+      l2Promotion,
+      oobFill);
+}
+
+#include <cutlass/core_io.h>
+#include <cutlass/cutlass.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/half.h>
+#include <cutlass/numeric_types.h>
+#include <cutlass/trace.h>
+#include <cutlass/util/host_tensor.h>
+
+// Rename the global function symbol
+#define cuTensorMapEncodeTiled nvrtc_cuTensorMapEncodeTiled
+#include <cute/tensor.hpp>
+#undef cuTensorMapEncodeTiled
+// Set everything back to normal
+
+#include <cutlass/gemm/collective/collective_builder.hpp>
+#include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
+
+#include <cute/atom/mma_atom.hpp>
+#include <cutlass/gemm/dispatch_policy.hpp>
+#include <cutlass/gemm/kernel/gemm_universal.hpp>
+#include <cutlass/util/packed_stride.hpp>
+#include <cutlass/epilogue/threadblock/default_epilogue_direct_store.h>
+
+#include <cutlass/util/reference/device/gemm.h>
+#include <cutlass/util/reference/device/tensor_compare.h>
+#include <cutlass/util/reference/device/tensor_fill.h>
+
+namespace c10d {
+namespace symmetric_memory {
+
+using namespace cute;
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+/// GEMM kernel configurations
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// A matrix configuration
+using         ElementA    = cutlass::bfloat16_t;                                          // Element type for A matrix operand
+using         LayoutA     = cutlass::layout::RowMajor;                      // Layout type for A matrix operand
+constexpr int AlignmentA  = 128 / cutlass::sizeof_bits<ElementA>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
+
+// B matrix configuration
+using         ElementB    = cutlass::bfloat16_t;                                          // Element type for B matrix operand
+using         LayoutB     = cutlass::layout::ColumnMajor;                   // Layout type for B matrix operand
+constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of B matrix in units of elements (up to 16 bytes)
+
+// C/D matrix configuration
+using         ElementC    = cutlass::bfloat16_t;                                          // Element type for C and D matrix operands
+using         LayoutC     = cutlass::layout::RowMajor;                   // Layout type for C and D matrix operands
+constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of C matrix in units of elements (up to 16 bytes)
+
+// Core kernel configurations
+using ElementAccumulator  = float;                                          // Element type for internal accumulation
+using ArchTag             = cutlass::arch::Sm90;                            // Tag indicating the minimum SM that supports the intended feature
+using OperatorClass       = cutlass::arch::OpClassTensorOp;                 // Operator class tag
+using TileShape           = Shape<_64,_128,_64>;                           // Threadblock-level tile size
+using ClusterShape        = Shape<_1,_1,_1>;                                // Shape of the threadblocks in a cluster
+using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
+using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
+
+// using FusionOp = typename cutlass::epilogue::fusion::ScaledAcc<ElementC,ElementAccumulator>;
+
+using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+    TileShape, ClusterShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementAccumulator, ElementAccumulator,
+    ElementC, LayoutC, AlignmentC,
+    ElementC, LayoutC, AlignmentC,
+    // cutlass::epilogue::collective::EpilogueScheduleAuto
+    cutlass::epilogue::TmaWarpSpecialized
+  >::CollectiveOp;
+
+
+using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+    ArchTag, OperatorClass,
+    ElementA, LayoutA, AlignmentA,
+    ElementB, LayoutB, AlignmentB,
+    ElementAccumulator,
+    TileShape, ClusterShape,
+    cutlass::gemm::collective::StageCountAutoCarveout<
+      static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+    // cutlass::gemm::collective::KernelScheduleAuto
+    cutlass::gemm::KernelTmaWarpSpecializedPingpong
+  >::CollectiveOp;
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+    Shape<int,int,int>, // Indicates ProblemShape
+    CollectiveMainloop,
+    CollectiveEpilogue
+>;
+
+using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+using StrideA = typename Gemm::GemmKernel::StrideA;
+using StrideB = typename Gemm::GemmKernel::StrideB;
+using StrideC = typename Gemm::GemmKernel::StrideC;
+using StrideD = typename Gemm::GemmKernel::StrideD;
+
+
+at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_workspace) {
+  TORCH_CHECK(a.is_contiguous());
+  TORCH_CHECK(b.stride(1) == b.size(0));
+  TORCH_CHECK(b.stride(0) == 1);
+
+  // TODO: temporary
+  TORCH_CHECK_EQ(a.scalar_type(), at::kBFloat16);
+  TORCH_CHECK_EQ(b.scalar_type(), at::kBFloat16);
+
+  int64_t m = a.sizes()[0];
+  int64_t n = b.sizes()[1];
+  int64_t k = a.sizes()[1];
+  TORCH_CHECK_EQ(b.sizes()[0], k);
+
+  auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
+  auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+  auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
+  auto stride_D = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+
+  auto c = a.new_empty({m, n});
+  auto d = a.new_empty({m, n});
+
+  Gemm gemm;
+
+  typename Gemm::Arguments arguments {
+    cutlass::gemm::GemmUniversalMode::kGemm,
+    {m, n, k},
+    {
+      reinterpret_cast<ElementA*>(a.data_ptr<at::BFloat16>()),
+      stride_A,
+      reinterpret_cast<ElementB*>(b.data_ptr<at::BFloat16>()),
+      stride_B,
+    },
+    {
+      {1, 1},
+      reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
+      stride_C,
+      reinterpret_cast<ElementC*>(d.data_ptr<at::BFloat16>()),
+      stride_D
+    },
+  };
+
+  // Using the arguments, query for extra workspace required for matrix multiplication computation
+  size_t workspace_size = Gemm::get_workspace_size(arguments);
+
+  // Allocate workspace memory
+  cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+  // Check if the problem size is supported or not
+  TORCH_CHECK(gemm.can_implement(arguments) == cutlass::Status::kSuccess);
+
+  // Initialize CUTLASS kernel with arguments and workspace pointer
+  TORCH_CHECK(gemm.initialize(arguments, workspace.get()) == cutlass::Status::kSuccess);
+
+  // Correctness / Warmup iteration
+  TORCH_CHECK(gemm.run() == cutlass::Status::kSuccess);
+  return d;
+}
+
+} // namespace symmetric_memory
+} // namespace c10d

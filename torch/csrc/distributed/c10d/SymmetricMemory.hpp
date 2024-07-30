@@ -63,6 +63,10 @@ class TORCH_API SymmetricMemory : public c10::intrusive_ptr_target {
 
   virtual int get_rank() = 0;
   virtual int get_world_size() = 0;
+
+  virtual at::Tensor matmul_reduce_scatter(
+      at::Tensor& a, at::Tensor& b, at::Tensor& workspace) = 0;
+
 };
 
 class SymmetricMemoryAllocator : public c10::intrusive_ptr_target {

@@ -1064,7 +1064,13 @@ This class does not support ``__members__`` property.)");
           "wait_signal",
           &SymmetricMemory::wait_signal,
           py::arg("src_rank"),
-          py::arg("channel") = 0);
+          py::arg("channel") = 0)
+      .def(
+          "matmul_reduce_scatter",
+          &SymmetricMemory::matmul_reduce_scatter,
+          py::arg("a"),
+          py::arg("b"),
+          py::arg("workspace"));
 
   auto store =
       py::class_<::c10d::Store, c10::intrusive_ptr<::c10d::Store>, PythonStore>(
