@@ -746,7 +746,17 @@ using ClusterShape        = Shape<_1,_1,_1>;                                // S
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
-// using FusionOp = typename cutlass::epilogue::fusion::ScaledAcc<ElementC,ElementAccumulator>;
+using EvtMul = cutlass::epilogue::fusion::Sm90Compute<
+    cutlass::multiplies,
+    ElementC, // First stage output type.
+    ElementAccumulator, // First stage input types.
+    cutlass::FloatRoundStyle::round_to_nearest>;
+
+using Scale = cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>;
+
+using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
+
+using MyEVT = cutlass::epilogue::fusion::Sm90EVT<EvtMul, Scale, Accum>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
