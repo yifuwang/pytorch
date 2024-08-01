@@ -756,7 +756,8 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementC, LayoutC, AlignmentC,
     ElementC, LayoutC, AlignmentC,
     // cutlass::epilogue::collective::EpilogueScheduleAuto
-    cutlass::epilogue::TmaWarpSpecialized
+    cutlass::epilogue::TmaWarpSpecialized,
+    cutlass::epilogue::fusion::ScaledAcc<ElementC, ElementAccumulator>
   >::CollectiveOp;
 
 
