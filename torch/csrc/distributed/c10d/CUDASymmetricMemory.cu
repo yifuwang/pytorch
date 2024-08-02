@@ -737,33 +737,50 @@ struct Sm90AuxStoreBuilder {
       typename AuxStoreDescriptor::CopyOpR2S>;
 };
 
-// template<int size>
-// struct Sm90MultiStoreBuilder {
-//   using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
-//       AuxStoreDescriptor::Stages,
-//       AuxStoreDescriptor::EpilogueTile,
-//       AuxStoreDescriptor::Element,
-//       cutlass::FloatRoundStyle::round_to_nearest,
-//       AuxStoreDescriptor::Stride,
-//       AuxStoreDescriptor::SmemLayoutAtom,
-//       AuxStoreDescriptor::CopyOpR2S>;
-// 
-//   using EVT = Sm90EVT<AuxStore, typename Sm90MultiStoreBuilder<size - 1>::EVT>;
-// };
-// 
-// template<int size>
-// struct Sm90MultiStoreBuilder<1> {
-//   using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
-//       AuxStoreDescriptor::Stages,
-//       AuxStoreDescriptor::EpilogueTile,
-//       AuxStoreDescriptor::Element,
-//       cutlass::FloatRoundStyle::round_to_nearest,
-//       AuxStoreDescriptor::Stride,
-//       AuxStoreDescriptor::SmemLayoutAtom,
-//       AuxStoreDescriptor::CopyOpR2S>;
-// 
-//   using EVT = Sm90EVT<AuxStore, cutlass::epilogue::fusion::Sm90AccFetch>>;
-// };
+template<
+  int count,
+  typename TileShape,
+  typename EpilogueTileType,
+  typename ElementOut,
+  typename LayoutOut,
+  typename Schedule
+>
+struct Sm90MultiStoreBuilder {
+  using AuxStore = typename Sm90AuxStoreBuilder<
+      TileShape,
+      EpilogueTileType,
+      ElementOut,
+      LayoutOut,
+      Schedule>::AuxStore;
+
+  using EVT = cutlass::epilogue::fusion::Sm90EVT<
+      AuxStore,
+      typename Sm90MultiStoreBuilder<
+          count - 1,
+          TileShape,
+          EpilogueTileType,
+          ElementOut,
+          LayoutOut,
+          Schedule>::EVT>;
+};
+
+template<
+  typename TileShape,
+  typename EpilogueTileType,
+  typename ElementOut,
+  typename LayoutOut,
+  typename Schedule
+>
+struct Sm90MultiStoreBuilder<1, TileShape, EpilogueTileType, ElementOut, LayoutOut, Schedule> {
+  using AuxStore = typename Sm90AuxStoreBuilder<
+      TileShape,
+      EpilogueTileType,
+      ElementOut,
+      LayoutOut,
+      Schedule>::AuxStore;
+
+  using EVT = cutlass::epilogue::fusion::Sm90EVT<AuxStore, cutlass::epilogue::fusion::Sm90AccFetch>;
+};
 
 namespace c10d {
 namespace symmetric_memory {
@@ -802,14 +819,24 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
+  // using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
+  //     Compute,
+  //     cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
+  //     cutlass::epilogue::fusion::Sm90EVT<
+  //         AuxStore,
+  //         cutlass::epilogue::fusion::Sm90EVT<
+  //             AuxStore,
+  //             cutlass::epilogue::fusion::Sm90AccFetch>>>;
   using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
       Compute,
       cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
-      cutlass::epilogue::fusion::Sm90EVT<
-          AuxStore,
-          cutlass::epilogue::fusion::Sm90EVT<
-              AuxStore,
-              cutlass::epilogue::fusion::Sm90AccFetch>>>;
+      typename Sm90MultiStoreBuilder<
+          2,
+          TileShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementC,
+          LayoutC,
+          cutlass::epilogue::TmaWarpSpecialized>::EVT>;
 
   // Epilogue
   using CollectiveEpilogue =
@@ -829,6 +856,7 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           AlignmentC,
           cutlass::epilogue::TmaWarpSpecialized,
           EpilogueEVT>::CollectiveOp;
+          // cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
 
   // Mainloop
   using CollectiveMainloop =
@@ -886,14 +914,12 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
     buffers.emplace_back(
         symm_mem->get_buffer(
             r, c.sizes(), c.scalar_type(), m * n * symm_mem->get_rank()));
+    // buffers.emplace_back(a.new_empty({m, n}));
   }
 
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
-
-  auto x0 = a.new_empty({m, n});
-  auto x1 = a.new_empty({m, n});
 
   Gemm gemm;
 
@@ -920,9 +946,9 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
     {  // AuxStore
       {  // AuxStore
         {}, // AccFetch
-        {reinterpret_cast<ElementC*>(x0.data_ptr<at::BFloat16>())}
+        {reinterpret_cast<ElementC*>(buffers[0].data_ptr<at::BFloat16>())}
       },
-      {reinterpret_cast<ElementC*>(x1.data_ptr<at::BFloat16>())}
+      {reinterpret_cast<ElementC*>(buffers[1].data_ptr<at::BFloat16>())}
     }
   };
 
@@ -941,7 +967,8 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(
     at::Tensor& a,
     at::Tensor& b,
     at::Tensor& symm_mem) {
-  mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
+  // mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
+  mm_broadcast_out<Shape<_64, _128, _64>, Shape<_2, _1, _1>>(a, b, symm_mem);
   return a;
 }
 
