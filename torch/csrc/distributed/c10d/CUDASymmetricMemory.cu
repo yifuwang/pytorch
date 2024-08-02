@@ -544,6 +544,7 @@ c10::intrusive_ptr<SymmetricMemory> CUDASymmetricMemoryAllocator::rendezvous(
 #if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
   auto block = find_block(ptr);
   if (block == nullptr) {
+    LOG(INFO) << "block not found";
     return nullptr;
   }
 
@@ -768,7 +769,7 @@ namespace c10d {
 namespace symmetric_memory {
 
 template <typename TileShape_MNK, typename ClusterShape_MNK>
-void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
+void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor) {
   using ElementA = cutlass::bfloat16_t;
   using LayoutA = cutlass::layout::RowMajor;
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
@@ -788,27 +789,6 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   using TileShape = Shape<_64, _128, _64>;
   using ClusterShape = Shape<_1, _1, _1>;
 
-  // EVT
-  // using EpilogueDescriptor =
-  //     cutlass::epilogue::collective::detail::EpilogueDescriptor<
-  //         TileShape,
-  //         cutlass::epilogue::collective::EpilogueTileAuto,
-  //         ElementC,
-  //         ElementC,
-  //         cutlass::epilogue::TmaWarpSpecialized>;
-
-  // using AuxStoreDescriptor = cutlass::epilogue::collective::detail::
-  //     AuxStoreDescriptor<EpilogueDescriptor, LayoutC, ElementC>;
-
-  // using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
-  //     AuxStoreDescriptor::Stages,
-  //     AuxStoreDescriptor::EpilogueTile,
-  //     AuxStoreDescriptor::Element,
-  //     cutlass::FloatRoundStyle::round_to_nearest,
-  //     AuxStoreDescriptor::Stride,
-  //     AuxStoreDescriptor::SmemLayoutAtom,
-  //     AuxStoreDescriptor::CopyOpR2S>;
-
   using AuxStore = typename Sm90AuxStoreBuilder<
       TileShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
@@ -825,10 +805,11 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
       Compute,
       cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
-      cutlass::epilogue::fusion::
-          Sm90EVT<AuxStore, cutlass::epilogue::fusion::Sm90AccFetch>>;
-
-  using EpilogueEVT2 = cutlass::epilogue::fusion::Sm90EVT<AuxStore, EpilogueEVT>;
+      cutlass::epilogue::fusion::Sm90EVT<
+          AuxStore,
+          cutlass::epilogue::fusion::Sm90EVT<
+              AuxStore,
+              cutlass::epilogue::fusion::Sm90AccFetch>>>;
 
   // Epilogue
   using CollectiveEpilogue =
@@ -847,8 +828,7 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
           LayoutC,
           AlignmentC,
           cutlass::epilogue::TmaWarpSpecialized,
-          // EpilogueEVT>::CollectiveOp;
-          EpilogueEVT2>::CollectiveOp;
+          EpilogueEVT>::CollectiveOp;
 
   // Mainloop
   using CollectiveMainloop =
@@ -894,12 +874,26 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   int64_t k = a.sizes()[1];
   TORCH_CHECK_EQ(b.sizes()[0], k);
 
+  // TODO: no use
+  auto c = a.new_empty({m, n});
+
+  auto symm_mem = get_symmetric_memory(symm_mem_tensor);
+  TORCH_CHECK(symm_mem != nullptr);
+  std::vector<at::Tensor> buffers;
+
+  TORCH_CHECK(symm_mem->get_world_size() == 2);
+  for (auto r = 0; r < 2; ++r) {
+    buffers.emplace_back(
+        symm_mem->get_buffer(
+            r, c.sizes(), c.scalar_type(), m * n * symm_mem->get_rank()));
+  }
+
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
   auto stride_B = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
   auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
 
-  auto c = a.new_empty({m, n});
-  auto d = a.new_empty({m, n});
+  auto x0 = a.new_empty({m, n});
+  auto x1 = a.new_empty({m, n});
 
   Gemm gemm;
 
@@ -921,24 +915,15 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
       },
   };
 
-  // arguments.epilogue.thread = {  // Compute (mul)
-  //     {2.0},  // ScalarBroadcast
-  //     {  // AuxStore
-  //       {},  // AccFetch
-  //       {reinterpret_cast<ElementC*>(symm_mem.data_ptr<at::BFloat16>())}
-  //     },
-  //     {},
-  // };
-  arguments.epilogue.thread = {  // AuxStore
-    {  // Compute (mul)
-        {2.0},  // ScalarBroadcast
-        {  // AuxStore
-          {},  // AccFetch
-          {reinterpret_cast<ElementC*>(symm_mem.data_ptr<at::BFloat16>())}
-        },
-        {},
-    },
-    {reinterpret_cast<ElementC*>(d.data_ptr<at::BFloat16>())}
+  arguments.epilogue.thread = {  // Compute (mul)
+    {1.0},  // ScalarBroadcast
+    {  // AuxStore
+      {  // AuxStore
+        {}, // AccFetch
+        {reinterpret_cast<ElementC*>(x0.data_ptr<at::BFloat16>())}
+      },
+      {reinterpret_cast<ElementC*>(x1.data_ptr<at::BFloat16>())}
+    }
   };
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
@@ -947,7 +932,6 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   TORCH_CHECK(gemm.can_implement(arguments) == cutlass::Status::kSuccess);
   TORCH_CHECK(
       gemm.initialize(arguments, workspace.get()) == cutlass::Status::kSuccess);
-  // TORCH_CHECK(gemm.run() == cutlass::Status::kSuccess);
   TORCH_CHECK(
       gemm(at::cuda::getCurrentCUDAStream()) == cutlass::Status::kSuccess);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -957,7 +941,7 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(
     at::Tensor& a,
     at::Tensor& b,
     at::Tensor& symm_mem) {
-  mm_split_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
+  mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
   return a;
 }
 
