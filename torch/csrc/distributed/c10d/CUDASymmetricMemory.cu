@@ -697,20 +697,75 @@ static CUresult CUDAAPI nvrtc_cuTensorMapEncodeTiled(
 #undef cuTensorMapEncodeTiled
 // Set everything back to normal
 
-#include <cutlass/epilogue/collective/collective_builder.hpp>
 #include <cutlass/gemm/collective/collective_builder.hpp>
 #include <cutlass/gemm/device/gemm_universal_adapter.h>
+#include <cutlass/epilogue/collective/collective_builder.hpp>
 
 #include <cute/atom/mma_atom.hpp>
-#include <cutlass/epilogue/threadblock/default_epilogue_direct_store.h>
 #include <cutlass/gemm/dispatch_policy.hpp>
 #include <cutlass/gemm/kernel/gemm_universal.hpp>
 #include <cutlass/util/packed_stride.hpp>
 
+using namespace cute;
+
+template<
+  typename TileShape,
+  typename EpilogueTileType,
+  typename ElementOut,
+  typename LayoutOut,
+  typename Schedule
+>
+struct Sm90AuxStoreBuilder {
+  using EpilogueDescriptor = cutlass::epilogue::collective::detail::EpilogueDescriptor<
+      TileShape,
+      EpilogueTileType,
+      ElementOut,
+      ElementOut,
+      Schedule>;
+
+  using AuxStoreDescriptor = cutlass::epilogue::collective::detail::
+      AuxStoreDescriptor<EpilogueDescriptor, LayoutOut, ElementOut>;
+
+  using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
+      AuxStoreDescriptor::Stages,
+      typename AuxStoreDescriptor::EpilogueTile,
+      typename AuxStoreDescriptor::Element,
+      cutlass::FloatRoundStyle::round_to_nearest,
+      typename AuxStoreDescriptor::Stride,
+      typename AuxStoreDescriptor::SmemLayoutAtom,
+      typename AuxStoreDescriptor::CopyOpR2S>;
+};
+
+// template<int size>
+// struct Sm90MultiStoreBuilder {
+//   using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
+//       AuxStoreDescriptor::Stages,
+//       AuxStoreDescriptor::EpilogueTile,
+//       AuxStoreDescriptor::Element,
+//       cutlass::FloatRoundStyle::round_to_nearest,
+//       AuxStoreDescriptor::Stride,
+//       AuxStoreDescriptor::SmemLayoutAtom,
+//       AuxStoreDescriptor::CopyOpR2S>;
+// 
+//   using EVT = Sm90EVT<AuxStore, typename Sm90MultiStoreBuilder<size - 1>::EVT>;
+// };
+// 
+// template<int size>
+// struct Sm90MultiStoreBuilder<1> {
+//   using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
+//       AuxStoreDescriptor::Stages,
+//       AuxStoreDescriptor::EpilogueTile,
+//       AuxStoreDescriptor::Element,
+//       cutlass::FloatRoundStyle::round_to_nearest,
+//       AuxStoreDescriptor::Stride,
+//       AuxStoreDescriptor::SmemLayoutAtom,
+//       AuxStoreDescriptor::CopyOpR2S>;
+// 
+//   using EVT = Sm90EVT<AuxStore, cutlass::epilogue::fusion::Sm90AccFetch>>;
+// };
+
 namespace c10d {
 namespace symmetric_memory {
-
-using namespace cute;
 
 template <typename TileShape_MNK, typename ClusterShape_MNK>
 void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
@@ -734,25 +789,32 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   using ClusterShape = Shape<_1, _1, _1>;
 
   // EVT
-  using EpilogueDescriptor =
-      cutlass::epilogue::collective::detail::EpilogueDescriptor<
-          TileShape,
-          cutlass::epilogue::collective::EpilogueTileAuto,
-          ElementC,
-          ElementC,
-          cutlass::epilogue::TmaWarpSpecialized>;
+  // using EpilogueDescriptor =
+  //     cutlass::epilogue::collective::detail::EpilogueDescriptor<
+  //         TileShape,
+  //         cutlass::epilogue::collective::EpilogueTileAuto,
+  //         ElementC,
+  //         ElementC,
+  //         cutlass::epilogue::TmaWarpSpecialized>;
 
-  using AuxStoreDescriptor = cutlass::epilogue::collective::detail::
-      AuxStoreDescriptor<EpilogueDescriptor, LayoutC, ElementC>;
+  // using AuxStoreDescriptor = cutlass::epilogue::collective::detail::
+  //     AuxStoreDescriptor<EpilogueDescriptor, LayoutC, ElementC>;
 
-  using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
-      AuxStoreDescriptor::Stages,
-      AuxStoreDescriptor::EpilogueTile,
-      AuxStoreDescriptor::Element,
-      cutlass::FloatRoundStyle::round_to_nearest,
-      AuxStoreDescriptor::Stride,
-      AuxStoreDescriptor::SmemLayoutAtom,
-      AuxStoreDescriptor::CopyOpR2S>;
+  // using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
+  //     AuxStoreDescriptor::Stages,
+  //     AuxStoreDescriptor::EpilogueTile,
+  //     AuxStoreDescriptor::Element,
+  //     cutlass::FloatRoundStyle::round_to_nearest,
+  //     AuxStoreDescriptor::Stride,
+  //     AuxStoreDescriptor::SmemLayoutAtom,
+  //     AuxStoreDescriptor::CopyOpR2S>;
+
+  using AuxStore = typename Sm90AuxStoreBuilder<
+      TileShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementC,
+      LayoutC,
+      cutlass::epilogue::TmaWarpSpecialized>::AuxStore;
 
   using Compute = cutlass::epilogue::fusion::Sm90Compute<
       cutlass::multiplies,
@@ -765,6 +827,8 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
       cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
       cutlass::epilogue::fusion::
           Sm90EVT<AuxStore, cutlass::epilogue::fusion::Sm90AccFetch>>;
+
+  using EpilogueEVT2 = cutlass::epilogue::fusion::Sm90EVT<AuxStore, EpilogueEVT>;
 
   // Epilogue
   using CollectiveEpilogue =
@@ -783,7 +847,8 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
           LayoutC,
           AlignmentC,
           cutlass::epilogue::TmaWarpSpecialized,
-          EpilogueEVT>::CollectiveOp;
+          // EpilogueEVT>::CollectiveOp;
+          EpilogueEVT2>::CollectiveOp;
 
   // Mainloop
   using CollectiveMainloop =
@@ -834,6 +899,7 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
   auto stride_C = cutlass::make_cute_packed_stride(StrideC{}, {m, n, 1});
 
   auto c = a.new_empty({m, n});
+  auto d = a.new_empty({m, n});
 
   Gemm gemm;
 
@@ -855,11 +921,24 @@ void mm_split_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem) {
       },
   };
 
-  arguments.epilogue.thread = {
-      {2.0},
-      {{}, // Accum
-       {reinterpret_cast<ElementC*>(symm_mem.data_ptr<at::BFloat16>())}},
-      {}, // mul op
+  // arguments.epilogue.thread = {  // Compute (mul)
+  //     {2.0},  // ScalarBroadcast
+  //     {  // AuxStore
+  //       {},  // AccFetch
+  //       {reinterpret_cast<ElementC*>(symm_mem.data_ptr<at::BFloat16>())}
+  //     },
+  //     {},
+  // };
+  arguments.epilogue.thread = {  // AuxStore
+    {  // Compute (mul)
+        {2.0},  // ScalarBroadcast
+        {  // AuxStore
+          {},  // AccFetch
+          {reinterpret_cast<ElementC*>(symm_mem.data_ptr<at::BFloat16>())}
+        },
+        {},
+    },
+    {reinterpret_cast<ElementC*>(d.data_ptr<at::BFloat16>())}
   };
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
