@@ -284,6 +284,16 @@ void f8f8bf16_rowwise_impl(
         {}, // Plus
     };
   } else {
+  // using Compute1 = cutlass::epilogue::fusion::Sm90Compute<
+  //     cutlass::multiplies,
+  //     cute::conditional_t< // Second stage output type.
+  //         USE_BIAS,
+  //         ElementBias,
+  //         ElementOutput>,
+  //     ElementComputeEpilogue, // Second stage input types.
+  //     cutlass::FloatRoundStyle::round_to_nearest>;
+  // using EVTCompute1 =
+  //     cutlass::epilogue::fusion::Sm90EVT<Compute1, XScale, EVTCompute0>;
     arguments.epilogue.thread = {
         {reinterpret_cast<ElementComputeEpilogue*>(
             x_scale.data_ptr())}, // x_scale

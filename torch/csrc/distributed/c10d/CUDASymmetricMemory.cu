@@ -746,17 +746,16 @@ using ClusterShape        = Shape<_1,_1,_1>;                                // S
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
-using EvtMul = cutlass::epilogue::fusion::Sm90Compute<
+using Compute = cutlass::epilogue::fusion::Sm90Compute<
     cutlass::multiplies,
     ElementC, // First stage output type.
     ElementAccumulator, // First stage input types.
     cutlass::FloatRoundStyle::round_to_nearest>;
 
-using Scale = cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>;
-
-using Accum = cutlass::epilogue::fusion::Sm90AccFetch;
-
-using MyEVT = cutlass::epilogue::fusion::Sm90EVT<EvtMul, Scale, Accum>;
+using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
+    Compute,
+    cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
+    cutlass::epilogue::fusion::Sm90AccFetch>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
@@ -765,9 +764,8 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     ElementAccumulator, ElementAccumulator,
     ElementC, LayoutC, AlignmentC,
     ElementC, LayoutC, AlignmentC,
-    // cutlass::epilogue::collective::EpilogueScheduleAuto
     cutlass::epilogue::TmaWarpSpecialized,
-    cutlass::epilogue::fusion::ScaledAcc<ElementC, ElementAccumulator>
+    EpilogueEVT
   >::CollectiveOp;
 
 
@@ -779,7 +777,6 @@ using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder
     TileShape, ClusterShape,
     cutlass::gemm::collective::StageCountAutoCarveout<
       static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-    // cutlass::gemm::collective::KernelScheduleAuto
     cutlass::gemm::KernelTmaWarpSpecializedPingpong
   >::CollectiveOp;
 
@@ -831,12 +828,21 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(at::Tensor& a, at::Tensor&
       stride_B,
     },
     {
-      {1, 1},
+      {},  // thread
       reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
       stride_C,
-      reinterpret_cast<ElementC*>(d.data_ptr<at::BFloat16>()),
-      stride_D
+      reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
+      stride_C,
     },
+  };
+
+  auto scale = at::empty({1}, at::TensorOptions().dtype(at::kFloat).device(a.device()));
+  scale.fill_(2);
+
+  arguments.epilogue.thread = {
+    {2.0},
+    {}, // Accum
+    {}, // mul op
   };
 
   // Using the arguments, query for extra workspace required for matrix multiplication computation
@@ -853,7 +859,7 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(at::Tensor& a, at::Tensor&
 
   // Correctness / Warmup iteration
   TORCH_CHECK(gemm.run() == cutlass::Status::kSuccess);
-  return d;
+  return c;
 }
 
 } // namespace symmetric_memory
