@@ -874,7 +874,8 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
+          // cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
+          cutlass::gemm::KernelTmaWarpSpecialized>::CollectiveOp;
 
   // Kernel
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -968,7 +969,7 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(
     at::Tensor& b,
     at::Tensor& symm_mem) {
   // mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
-  mm_broadcast_out<Shape<_64, _128, _64>, Shape<_2, _1, _1>>(a, b, symm_mem);
+  mm_broadcast_out<Shape<_128, _256, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
   return a;
 }
 
