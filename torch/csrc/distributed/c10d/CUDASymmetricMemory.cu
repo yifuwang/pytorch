@@ -746,16 +746,45 @@ using ClusterShape        = Shape<_1,_1,_1>;                                // S
 using StageCountType = cutlass::gemm::collective::StageCountAuto;           // Stage count maximized based on the tile size
 using KernelSchedule = cutlass::gemm::collective::KernelScheduleAuto;       // Kernel to launch based on the default setting in the Collective Builder
 
+
+using EpilogueDesc = cutlass::epilogue::collective::detail::EpilogueDescriptor<
+    TileShape,
+    cutlass::epilogue::collective::EpilogueTileAuto,
+    ElementC,
+    ElementC,
+    cutlass::epilogue::TmaWarpSpecialized>;
+
+using AuxStoreDesc = cutlass::epilogue::collective::detail::AuxStoreDescriptor<
+    EpilogueDesc,
+    LayoutC,
+    ElementC>;
+
+using AuxStore = cutlass::epilogue::fusion::Sm90AuxStore<
+    AuxStoreDesc::Stages,
+    AuxStoreDesc::EpilogueTile,
+    AuxStoreDesc::Element,
+    cutlass::FloatRoundStyle::round_to_nearest,
+    AuxStoreDesc::Stride,
+    AuxStoreDesc::SmemLayoutAtom,
+    AuxStoreDesc::CopyOpR2S>;
+
 using Compute = cutlass::epilogue::fusion::Sm90Compute<
     cutlass::multiplies,
     ElementC, // First stage output type.
     ElementAccumulator, // First stage input types.
     cutlass::FloatRoundStyle::round_to_nearest>;
 
+// using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
+//     Compute,
+//     cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
+//     cutlass::epilogue::fusion::Sm90AccFetch>;
+
 using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
     Compute,
     cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
-    cutlass::epilogue::fusion::Sm90AccFetch>;
+    cutlass::epilogue::fusion::Sm90EVT<
+        AuxStore,
+        cutlass::epilogue::fusion::Sm90AccFetch>>;
 
 using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
@@ -839,9 +868,17 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(at::Tensor& a, at::Tensor&
   auto scale = at::empty({1}, at::TensorOptions().dtype(at::kFloat).device(a.device()));
   scale.fill_(2);
 
+  // arguments.epilogue.thread = {
+  //   {2.0},
+  //   {}, // Accum
+  //   {}, // mul op
+  // };
   arguments.epilogue.thread = {
     {2.0},
-    {}, // Accum
+    {
+      {}, // Accum
+      {reinterpret_cast<ElementC*>(symm_mem_workspace.data_ptr<at::BFloat16>())}
+    },
     {}, // mul op
   };
 
