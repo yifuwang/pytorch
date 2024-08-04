@@ -785,7 +785,10 @@ struct Sm90MultiStoreBuilder<1, TileShape, EpilogueTileType, ElementOut, LayoutO
 namespace c10d {
 namespace symmetric_memory {
 
-template <typename TileShape_MNK, typename ClusterShape_MNK>
+template <
+  typename TileShape_MNK,
+  typename ClusterShape_MNK,
+  bool LocalKernel>
 void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor) {
   using ElementA = cutlass::bfloat16_t;
   using LayoutA = cutlass::layout::RowMajor;
@@ -806,6 +809,8 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
   using TileShape = Shape<_64, _128, _64>;
   using ClusterShape = Shape<_1, _1, _1>;
 
+  using TileSchedulerType = cutlass::gemm::PersistentScheduler;
+
   using AuxStore = typename Sm90AuxStoreBuilder<
       TileShape,
       cutlass::epilogue::collective::EpilogueTileAuto,
@@ -819,27 +824,18 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       ElementAccumulator,
       cutlass::FloatRoundStyle::round_to_nearest>;
 
-  // using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
-  //     Compute,
-  //     cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
-  //     cutlass::epilogue::fusion::Sm90EVT<
-  //         AuxStore,
-  //         cutlass::epilogue::fusion::Sm90EVT<
-  //             AuxStore,
-  //             cutlass::epilogue::fusion::Sm90AccFetch>>>;
   using EpilogueEVT = cutlass::epilogue::fusion::Sm90EVT<
       Compute,
       cutlass::epilogue::fusion::Sm90ScalarBroadcast<ElementAccumulator>,
       typename Sm90MultiStoreBuilder<
-          2,
+          1,
           TileShape,
           cutlass::epilogue::collective::EpilogueTileAuto,
           ElementC,
           LayoutC,
           cutlass::epilogue::TmaWarpSpecialized>::EVT>;
 
-  // Epilogue
-  using CollectiveEpilogue =
+  using CollectiveEpilogueDist =
       typename cutlass::epilogue::collective::CollectiveBuilder<
           cutlass::arch::Sm90,
           cutlass::arch::OpClassTensorOp,
@@ -856,7 +852,28 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           AlignmentC,
           cutlass::epilogue::TmaWarpSpecialized,
           EpilogueEVT>::CollectiveOp;
-          // cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+
+  using CollectiveEpilogueLocal =
+      typename cutlass::epilogue::collective::CollectiveBuilder<
+          cutlass::arch::Sm90,
+          cutlass::arch::OpClassTensorOp,
+          TileShape,
+          ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator,
+          ElementAccumulator,
+          void,
+          LayoutC,
+          AlignmentC,
+          ElementC,
+          LayoutC,
+          AlignmentC,
+          cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
+
+  using CollectiveEpilogue = typename std::conditional<
+      LocalKernel, 
+      CollectiveEpilogueLocal,
+      CollectiveEpilogueDist>::type;
 
   // Mainloop
   using CollectiveMainloop =
@@ -874,8 +891,7 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           ClusterShape,
           cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
-          // cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
-          cutlass::gemm::KernelTmaWarpSpecialized>::CollectiveOp;
+          cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
 
   // Kernel
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -888,7 +904,6 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
   using StrideA = typename Gemm::GemmKernel::StrideA;
   using StrideB = typename Gemm::GemmKernel::StrideB;
   using StrideC = typename Gemm::GemmKernel::StrideC;
-  using StrideD = typename Gemm::GemmKernel::StrideD;
 
   TORCH_CHECK(a.is_contiguous());
   TORCH_CHECK(b.stride(1) == b.size(0));
@@ -903,19 +918,16 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
   int64_t k = a.sizes()[1];
   TORCH_CHECK_EQ(b.sizes()[0], k);
 
-  // TODO: no use
-  auto c = a.new_empty({m, n});
-
-  auto symm_mem = get_symmetric_memory(symm_mem_tensor);
-  TORCH_CHECK(symm_mem != nullptr);
-  std::vector<at::Tensor> buffers;
-
-  TORCH_CHECK(symm_mem->get_world_size() == 2);
-  for (auto r = 0; r < 2; ++r) {
-    buffers.emplace_back(
-        symm_mem->get_buffer(
-            r, c.sizes(), c.scalar_type(), m * n * symm_mem->get_rank()));
-    // buffers.emplace_back(a.new_empty({m, n}));
+  at::Tensor c;
+  if constexpr (LocalKernel) {
+    c = a.new_empty({m, n});
+  } else {
+    auto symm_mem = get_symmetric_memory(symm_mem_tensor);
+    TORCH_CHECK(symm_mem != nullptr);
+    c = symm_mem->get_buffer(
+        (symm_mem->get_rank() + symm_mem->get_world_size() + 1) % symm_mem->get_world_size(),
+        c.sizes(),
+        c.scalar_type(), 0);
   }
 
   auto stride_A = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
@@ -935,23 +947,23 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       },
       {
           {}, // thread
-          reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
+          // reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
+          nullptr,
           stride_C,
           reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
           stride_C,
       },
   };
 
-  arguments.epilogue.thread = {  // Compute (mul)
-    {1.0},  // ScalarBroadcast
-    {  // AuxStore
-      {  // AuxStore
-        {}, // AccFetch
-        {reinterpret_cast<ElementC*>(buffers[0].data_ptr<at::BFloat16>())}
-      },
-      {reinterpret_cast<ElementC*>(buffers[1].data_ptr<at::BFloat16>())}
-    }
-  };
+  // if constexpr (LocalKernel) {
+  //   arguments.epilogue.thread = {  // Compute (mul)
+  //     {1.0},  // ScalarBroadcast
+  //     {  // AuxStore
+  //       {}, // AccFetch
+  //       {reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>())}
+  //     },
+  //   };
+  // }
 
   size_t workspace_size = Gemm::get_workspace_size(arguments);
   cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
@@ -969,7 +981,7 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(
     at::Tensor& b,
     at::Tensor& symm_mem) {
   // mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
-  mm_broadcast_out<Shape<_128, _256, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
+  mm_broadcast_out<Shape<_256, _128, _64>, Shape<_2, _1, _1>, true>(a, b, symm_mem);
   return a;
 }
 
