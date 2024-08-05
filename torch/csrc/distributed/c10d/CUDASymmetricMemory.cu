@@ -927,7 +927,8 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       float, float,
       void, cutlass::layout::RowMajor, 8,
       cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
-      cutlass::epilogue::NoSmemWarpSpecialized
+      // cutlass::epilogue::NoSmemWarpSpecialized
+      cutlass::epilogue::PtrArrayNoSmemWarpSpecialized
     >::CollectiveOp;
   
   using CollectiveMainloop =
@@ -944,7 +945,7 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
 
   // Kernel
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      Shape<int, int, int>,
+      Shape<int, int, int, int>,
       CollectiveMainloop,
       CollectiveEpilogue,
       cutlass::gemm::PersistentScheduler
@@ -987,9 +988,17 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
 
   Gemm gemm;
 
+
+  void *arr;
+  AT_CUDA_CHECK(cudaMalloc(&arr, sizeof(c.data_ptr<at::BFloat16>())));
+
+  void *arr_host = c.data_ptr<at::BFloat16>();
+  AT_CUDA_CHECK(cudaMemcpy(arr, &arr_host, sizeof(void*), cudaMemcpyHostToDevice));
+
+
   typename Gemm::Arguments arguments{
       cutlass::gemm::GemmUniversalMode::kGemm,
-      {m, n, k},
+      {m, n, k, 1},
       {
           reinterpret_cast<ElementA*>(a.data_ptr<at::BFloat16>()),
           stride_A,
@@ -1001,7 +1010,8 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           // reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
           nullptr,
           stride_C,
-          reinterpret_cast<ElementC*>(c.data_ptr<at::BFloat16>()),
+          // reinterpret_cast<ElementC**>(c.data_ptr<at::BFloat16>()),
+          reinterpret_cast<ElementC**>(arr),
           stride_C,
       },
   };
