@@ -795,7 +795,7 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
   constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
 
   using ElementB = cutlass::bfloat16_t;
-  using LayoutB = cutlass::layout::RowMajor;
+  using LayoutB = cutlass::layout::ColumnMajor;
   constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;
 
   using ElementC = cutlass::bfloat16_t;
@@ -835,94 +835,13 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
           LayoutC,
           cutlass::epilogue::TmaWarpSpecialized>::EVT>;
 
-  // using CollectiveEpilogueDist =
-  //     typename cutlass::epilogue::collective::CollectiveBuilder<
-  //         cutlass::arch::Sm90,
-  //         cutlass::arch::OpClassTensorOp,
-  //         TileShape,
-  //         ClusterShape,
-  //         cutlass::epilogue::collective::EpilogueTileAuto,
-  //         ElementAccumulator,
-  //         ElementAccumulator,
-  //         ElementC,
-  //         LayoutC,
-  //         AlignmentC,
-  //         ElementC,
-  //         LayoutC,
-  //         AlignmentC,
-  //         cutlass::epilogue::TmaWarpSpecialized,
-  //         EpilogueEVT>::CollectiveOp;
-
-  // using CollectiveEpilogueLocal =
-  //     typename cutlass::epilogue::collective::CollectiveBuilder<
-  //         cutlass::arch::Sm90,
-  //         cutlass::arch::OpClassTensorOp,
-  //         TileShape,
-  //         ClusterShape,
-  //         cutlass::epilogue::collective::EpilogueTileAuto,
-  //         ElementAccumulator,
-  //         ElementAccumulator,
-  //         void,
-  //         LayoutC,
-  //         AlignmentC,
-  //         ElementC,
-  //         LayoutC,
-  //         AlignmentC,
-  //         cutlass::epilogue::TmaWarpSpecialized>::CollectiveOp;
-
-  // using CollectiveEpilogue = typename std::conditional<
-  //     LocalKernel, 
-  //     CollectiveEpilogueLocal,
-  //     CollectiveEpilogueDist>::type;
-
-  // // Mainloop
-  // using CollectiveMainloop =
-  //     typename cutlass::gemm::collective::CollectiveBuilder<
-  //         ArchTag,
-  //         OperatorClass,
-  //         ElementA,
-  //         LayoutA,
-  //         AlignmentA,
-  //         ElementB,
-  //         LayoutB,
-  //         AlignmentB,
-  //         ElementAccumulator,
-  //         TileShape,
-  //         ClusterShape,
-  //         cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(
-  //             sizeof(typename CollectiveEpilogue::SharedStorage))>,
-  //         // cutlass::gemm::KernelTmaWarpSpecializedPingpong>::CollectiveOp;
-  //         cutlass::gemm::KernelTmaWarpSpecializedCooperative>::CollectiveOp;
-
-//  using CollectiveEpilogue =
-//  typename cutlass::epilogue::collective::CollectiveBuilder<
-//    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-//    cute::Shape<cute::_128, cute::_128, cute::_64>,
-//    cute::Shape<cute::_2,cute::_1,cute::_1>,
-//    cutlass::epilogue::collective::EpilogueTileAuto,
-//    float, float,
-//    ElementA, LayoutA, 128 / cutlass::sizeof_bits<ElementA>::value,
-//    ElementB, LayoutB, 128 / cutlass::sizeof_bits<ElementA>::value,
-//    cutlass::epilogue::NoSmemWarpSpecialized
-//  >::CollectiveOp;
-//
-//using CollectiveMainloop =
-//  typename cutlass::gemm::collective::CollectiveBuilder<
-//    cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-//    ElementA, LayoutA, 128 / cutlass::sizeof_bits<ElementA>::value,
-//    ElementB, LayoutB, 128 / cutlass::sizeof_bits<ElementA>::value,
-//    float,
-//    cute::Shape<cute::_256, cute::_128, cute::_64>,
-//    cute::Shape<cute::_2,cute::_1,cute::_1>,
-//    cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-//    cutlass::gemm::KernelTmaWarpSpecializedCooperative
-//  >::CollectiveOp;
-
   using CollectiveEpilogue =
     typename cutlass::epilogue::collective::CollectiveBuilder<
       cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
-      cute::Shape<cute::_128, cute::_128, cute::_64>,
-      cute::Shape<cute::_2,cute::_1,cute::_1>,
+      // cute::Shape<cute::_128, cute::_128, cute::_64>,
+      // cute::Shape<cute::_2,cute::_1,cute::_1>,
+      TileShape_MNK,
+      ClusterShape_MNK,
       cutlass::epilogue::collective::EpilogueTileAuto,
       float, float,
       void, cutlass::layout::RowMajor, 8,
@@ -937,11 +856,41 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
       cutlass::bfloat16_t, cutlass::layout::ColumnMajor, 8,
       float,
-      cute::Shape<cute::_128, cute::_128, cute::_64>,
-      cute::Shape<cute::_2,cute::_1,cute::_1>,
+      // cute::Shape<cute::_128, cute::_128, cute::_64>,
+      // cute::Shape<cute::_2,cute::_1,cute::_1>,
+      TileShape_MNK,
+      ClusterShape_MNK,
       cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-      cutlass::gemm::KernelTmaWarpSpecializedPingpong
+      // cutlass::gemm::KernelTmaWarpSpecializedPingpong
+      cutlass::gemm::KernelTmaWarpSpecializedCooperative
+      // cutlass::gemm::KernelTmaWarpSpecialized
     >::CollectiveOp;
+
+  // using CollectiveEpilogue =
+  // typename cutlass::epilogue::collective::CollectiveBuilder<
+  //   cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+  //   cute::Shape<cute::_128, cute::_128, cute::_64>,
+  //   cute::Shape<cute::_1,cute::_2,cute::_1>,
+  //   cutlass::epilogue::collective::EpilogueTileAuto,
+  //   float, float,
+  //   cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
+  //   cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
+  //   // cutlass::epilogue::NoSmemWarpSpecialized
+  //   cutlass::epilogue::PtrArrayNoSmemWarpSpecialized
+  // >::CollectiveOp;
+
+  // using CollectiveMainloop =
+  //   typename cutlass::gemm::collective::CollectiveBuilder<
+  //     cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp,
+  //     cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
+  //     cutlass::bfloat16_t, cutlass::layout::RowMajor, 8,
+  //     float,
+  //     cute::Shape<cute::_128, cute::_128, cute::_64>,
+  //     cute::Shape<cute::_1,cute::_2,cute::_1>,
+  //     cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+  //     cutlass::gemm::KernelTmaWarpSpecialized
+  //   >::CollectiveOp;
+
 
   // Kernel
   using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -949,6 +898,7 @@ void mm_broadcast_out(at::Tensor& a, at::Tensor& b, at::Tensor& symm_mem_tensor)
       CollectiveMainloop,
       CollectiveEpilogue,
       cutlass::gemm::PersistentScheduler
+      // cutlass::gemm::StreamKScheduler
     >;
 
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
@@ -1041,8 +991,9 @@ at::Tensor CUDASymmetricMemory::matmul_reduce_scatter(
     at::Tensor& a,
     at::Tensor& b,
     at::Tensor& symm_mem) {
-  // mm_broadcast_out<Shape<_64, _128, _64>, Shape<_1, _1, _1>>(a, b, symm_mem);
-  mm_broadcast_out<Shape<_128, _128, _64>, Shape<_2, _1, _1>, true>(a, b, symm_mem);
+  // mm_broadcast_out<Shape<_128, _128, _64>, Shape<_1, _2, _1>, true>(a, b, symm_mem); // good for 8192x8192x8192
+  mm_broadcast_out<Shape<_128, _128, _64>, Shape<_2, _8, _1>, true>(a, b, symm_mem); // good for 8192x8192x8192
+  // mm_broadcast_out<Shape<_16, _128, _128>, Shape<_1, _2, _2>, false>(a, b, symm_mem);
   return a;
 }
 
