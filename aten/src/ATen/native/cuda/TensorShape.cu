@@ -242,26 +242,52 @@ static inline int64_t get_num_chunks(const at::Tensor& tensor, int64_t dim) {
   return num_chunks;
 }
 
+// A grow-only, pinned host buffer that allows for asynchronous HtoD copying of
+// kernel arguments. The size of this buffer is expected to be limited to a few
+// hundred KBs. We are not using CachingHostAllocator because allocations from
+// users can render the allocations in these use cases always uncached. This is
+// a temporary hack. The proper solution is likely to involve having a
+// dedicated CachingHostAllocator pool for ATen internals.
+static thread_local int64_t* pinned_kernel_arg_buf = nullptr;
+static thread_local size_t pinned_kernel_arg_buf_sz = 0;
+
 // Pack multiple std::vector<int64_t> into a single cuda tensor.
 std::pair<at::Tensor, std::vector<int64_t*>> pack_vecs(
     std::vector<const std::vector<int64_t>*> vecs,
     const at::Device& device) {
-  int64_t numel = 0;
+  size_t numel = 0;
   for (const auto* vec : vecs) {
     numel += vec->size();
   }
 
-  auto packed = at::empty(
-      {numel}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+  if (pinned_kernel_arg_buf == nullptr ||
+      numel * sizeof(int64_t) > pinned_kernel_arg_buf_sz) {
+    if (pinned_kernel_arg_buf != nullptr) {
+      AT_CUDA_CHECK(cudaFreeHost(pinned_kernel_arg_buf));
+    }
+    // Don't bother rounding since we are grow-only
+    AT_CUDA_CHECK(cudaHostAlloc(
+        &pinned_kernel_arg_buf, numel * sizeof(int64_t), cudaHostAllocDefault));
+    pinned_kernel_arg_buf_sz = numel * sizeof(int64_t);
+  }
+
   size_t offset = 0;
   for (const auto* vec : vecs) {
     memcpy(
-        packed.data_ptr<int64_t>() + offset,
+        pinned_kernel_arg_buf + offset,
         vec->data(),
-        sizeof(int64_t) * vec->size());
+        vec->size() * sizeof(int64_t));
     offset += vec->size();
   }
-  packed = packed.to(device, /*non_blocking=*/true);
+  auto packed = at::empty(
+      {static_cast<int64_t>(numel)},
+      at::TensorOptions().dtype(at::kLong).device(device));
+  AT_CUDA_CHECK(cudaMemcpyAsync(
+      packed.data_ptr<int64_t>(),
+      pinned_kernel_arg_buf,
+      numel * sizeof(int64_t),
+      cudaMemcpyHostToDevice,
+      at::cuda::getCurrentCUDAStream()));
 
   std::vector<int64_t*> ptrs;
   ptrs.reserve(vecs.size());
