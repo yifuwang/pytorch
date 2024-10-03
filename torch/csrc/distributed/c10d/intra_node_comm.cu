@@ -110,6 +110,7 @@ static __global__ void oneShotAllReduceKernel(
 
   barrier_and_acquire_previous_kernel_writes(
       reinterpret_cast<uint32_t**>(p2pStates), rank, kWorldSize);
+  // barrier_(reinterpret_cast<uint32_t**>(p2pStates), rank, kWorldSize);
 
   // The source pointers. Distributed round-robin for the different warps
   const at::BFloat16* srcs[kWorldSize];
@@ -148,7 +149,7 @@ static __global__ void oneShotAllReduceKernel(
     }
   }
 
-  barrier(reinterpret_cast<uint32_t**>(p2pStates), rank, kWorldSize);
+  barrier_(reinterpret_cast<uint32_t**>(p2pStates), rank, kWorldSize);
 }
 
 template <uint32_t kWorldSize>

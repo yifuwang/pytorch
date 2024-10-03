@@ -65,6 +65,11 @@ __device__ __forceinline__ void release_signal(uint32_t* addr) {
     ;
 }
 
+__device__ __forceinline__ void put_signal(uint32_t* addr) {
+  while (cas_sys(addr, 0, 1) != 0)
+    ;
+}
+
 __device__ __forceinline__ void wait_signal(uint32_t* addr) {
   while (cas_sys(addr, 1, 0) != 1)
     ;
@@ -91,10 +96,22 @@ __device__ __forceinline__ void barrier(
     size_t world_size) {
   if (threadIdx.x < world_size) {
     auto target_rank = threadIdx.x;
-    release_signal(signal_pads[target_rank] + blockIdx.x * world_size + rank);
+    put_signal(signal_pads[target_rank] + blockIdx.x * world_size + rank);
     wait_signal(signal_pads[rank] + blockIdx.x * world_size + target_rank);
   }
   __syncthreads();
+}
+
+__device__ __forceinline__ void barrier_(
+    uint32_t** signal_pads,
+    size_t rank,
+    size_t world_size) {
+  if (threadIdx.x < world_size) {
+    auto target_rank = threadIdx.x;
+    put_signal(signal_pads[target_rank] + blockIdx.x * world_size + rank);
+    wait_signal(signal_pads[rank] + blockIdx.x * world_size + target_rank);
+  }
+  // __syncthreads();
 }
 
 // Perform a barrier and establish causality order between memory operations
