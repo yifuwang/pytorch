@@ -502,6 +502,38 @@ class SymmetricMemoryTest(MultiProcessTestCase):
         self.assertTrue(res.eq(self.world_size).all().item())
         dist.destroy_process_group()
 
+    @skip_if_lt_x_gpu(2)
+    @requires_multicast_support()
+    @parametrize("dtype", [torch.float, torch.bfloat16])
+    @parametrize("align_bytes", [4, 8, 16])
+    @parametrize("size_bytes", [4, 8192, 8196])
+    def test_one_shot_all_reduce(
+        self, dtype: torch.dtype, size_bytes: int, align_bytes: int
+    ) -> None:
+        self._init_process()
+        group_name = dist.group.WORLD.group_name
+
+        t = _SymmetricMemory.empty_strided_p2p(
+            size=(16384,),
+            stride=(1,),
+            dtype=dtype,
+            device=self.device,
+            group_name=group_name,
+        ).fill_(0)
+
+        self.assertTrue(t.data_ptr() % 16 == 0)
+        self.assertTrue(align_bytes % t.element_size() == 0)
+        self.assertTrue(size_bytes % t.element_size() == 0)
+
+        shift = align_bytes // t.element_size()
+        numel = size_bytes // t.element_size()
+        x = t[shift : shift + numel]
+        x.fill_(1)
+
+        res = torch.ops.symm_mem.one_shot_all_reduce(x, "sum", group_name)
+        self.assertTrue(res.eq(self.world_size).all().item())
+        dist.destroy_process_group()
+
     @skipIfRocm
     @skip_if_lt_x_gpu(2)
     def test_stream_write_value(self):

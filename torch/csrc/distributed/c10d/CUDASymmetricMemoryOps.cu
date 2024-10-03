@@ -187,6 +187,98 @@ static __global__ void multimem_one_shot_all_reduce_kernel(
   }
 }
 
+template <typename T, int alignment>
+static __global__ void one_shot_all_reduce_kernel(
+    T** input_ptrs,
+    T* output_ptr,
+    size_t input_offset,
+    size_t numel,
+    uint32_t** signal_pads,
+    size_t rank,
+    size_t world_size) {
+  static_assert(alignment % sizeof(T) == 0);
+  constexpr size_t numel_per_thread = alignment / sizeof(T);
+
+  barrier_and_acquire_previous_kernel_writes(signal_pads, rank, world_size);
+
+  auto offset = (blockDim.x * blockIdx.x + threadIdx.x) * numel_per_thread;
+  auto stride = blockDim.x * gridDim.x * numel_per_thread;
+
+  for (size_t i = offset; i < numel; i += stride) {
+    Vec<alignment> acc{};
+    for (size_t step = 0; step < world_size; ++step) {
+      size_t remote_rank = (rank + step) % world_size;
+      auto vec = ld_vec<alignment>(input_ptrs[remote_rank] + input_offset + i);
+      acc = add_vec<alignment, T>(acc, vec);
+    }
+    st_vec<alignment>(output_ptr + i, acc);
+    // auto vec = multimem_ld_reduce_add<alignment>(input_mc_ptr + i);
+    // *reinterpret_cast<decltype(vec.as_scalar)*>(output_ptr + i) = vec.as_scalar;
+  }
+  // TODO: barrier
+}
+
+at::Tensor one_shot_all_reduce(
+    const at::Tensor& input,
+    std::string reduce_op,
+    std::string group_name) {
+  TORCH_CHECK(
+      input.is_contiguous(),
+      "one_shot_all_reduce: input must be contiguous.");
+  TORCH_CHECK(
+      reduce_op == "sum",
+      "one_shot_all_reduce: only sum is supported for now.");
+
+  auto symm_mem = c10d::symmetric_memory::rendezvous(input);
+  TORCH_CHECK(
+      symm_mem != nullptr,
+      "one_shot_all_reduce: input must be allocated with empty_strided_p2p().");
+
+  auto output = at::empty_like(input);
+
+  const size_t alignment =
+      get_and_verify_alignment(input, "one_shot_all_reduce");
+
+  int num_blocks = 0, num_threads = 0;
+  init_elementwise_launch_config(
+      input.numel(),
+      input.element_size(),
+      alignment,
+      1,
+      num_blocks,
+      num_threads);
+
+#define DISPATCH(scalar_t, kernel_alignment)                                   \
+  if (alignment == kernel_alignment) {                                         \
+    one_shot_all_reduce_kernel<scalar_t, kernel_alignment>                     \
+        <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(    \
+            reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev()),     \
+            output.data_ptr<scalar_t>(),                                       \
+            input.storage_offset(),                                            \
+            input.numel(),                                                     \
+            reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev()), \
+            symm_mem->get_rank(),                                              \
+            symm_mem->get_world_size());                                       \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
+  }
+
+  AT_DISPATCH_SWITCH(
+      input.scalar_type(),
+      "one_shot_all_reduce",
+      AT_DISPATCH_CASE(at::kBFloat16, [&] {
+        DISPATCH(scalar_t, 16);
+        DISPATCH(scalar_t, 8);
+        DISPATCH(scalar_t, 4);
+      }) AT_DISPATCH_CASE(at::kFloat, [&] {
+        DISPATCH(scalar_t, 16);
+        DISPATCH(scalar_t, 8);
+        DISPATCH(scalar_t, 4);
+      }));
+
+#undef DISPATCH
+  return output;
+}
+
 at::Tensor multimem_one_shot_all_reduce(
     const at::Tensor& input,
     std::string reduce_op,
@@ -247,6 +339,7 @@ at::Tensor multimem_one_shot_all_reduce(
         DISPATCH(scalar_t, 4);
       }));
 
+#undef DISPATCH
   return output;
 }
 
@@ -259,6 +352,11 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
   m.def(
       "multimem_one_shot_all_reduce(Tensor input, str reduce_op, str group_name) -> Tensor",
       torch::dispatch(c10::DispatchKey::CUDA, ::multimem_one_shot_all_reduce),
+      {at::Tag::pt2_compliant_tag});
+
+  m.def(
+      "one_shot_all_reduce(Tensor input, str reduce_op, str group_name) -> Tensor",
+      torch::dispatch(c10::DispatchKey::CUDA, ::one_shot_all_reduce),
       {at::Tag::pt2_compliant_tag});
 }
 
