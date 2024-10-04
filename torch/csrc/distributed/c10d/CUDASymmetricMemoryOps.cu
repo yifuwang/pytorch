@@ -104,6 +104,7 @@ static __global__ void multimem_all_reduce_kernel(
   // Establish causality order - all writes are visible to all devices beyond
   // this point.
   __threadfence_system();
+  // TODO: optimize this
 }
 
 at::Tensor multimem_all_reduce_(
@@ -185,9 +186,11 @@ static __global__ void multimem_one_shot_all_reduce_kernel(
     auto vec = multimem_ld_reduce_add<alignment>(input_mc_ptr + i);
     *reinterpret_cast<decltype(vec.as_scalar)*>(output_ptr + i) = vec.as_scalar;
   }
+
+  barrier_(signal_pads, rank, world_size);
 }
 
-template <typename T, int alignment>
+template <typename T, int alignment, int k_world_size>
 static __global__ void one_shot_all_reduce_kernel(
     T** input_ptrs,
     T* output_ptr,
@@ -206,16 +209,26 @@ static __global__ void one_shot_all_reduce_kernel(
 
   for (size_t i = offset; i < numel; i += stride) {
     Vec<alignment> acc{};
-    for (size_t step = 0; step < world_size; ++step) {
-      size_t remote_rank = (rank + step) % world_size;
-      auto vec = ld_vec<alignment>(input_ptrs[remote_rank] + input_offset + i);
-      acc = add_vec<alignment, T>(acc, vec);
+    // k_world_size != -1 means we've specialized on world_size. Unroll the
+    // loop in this case.
+    if constexpr (k_world_size != -1) {
+#pragma unroll k_world_size
+      for (size_t step = 0; step < k_world_size; ++step) {
+        size_t remote_rank = (rank + step) % k_world_size;
+        auto vec = ld_vec<alignment>(input_ptrs[remote_rank] + input_offset + i);
+        acc = add_vec<alignment, T>(acc, vec);
+      }
+    } else {
+      for (size_t step = 0; step < world_size; ++step) {
+        size_t remote_rank = (rank + step) % world_size;
+        auto vec = ld_vec<alignment>(input_ptrs[remote_rank] + input_offset + i);
+        acc = add_vec<alignment, T>(acc, vec);
+      }
     }
     st_vec<alignment>(output_ptr + i, acc);
-    // auto vec = multimem_ld_reduce_add<alignment>(input_mc_ptr + i);
-    // *reinterpret_cast<decltype(vec.as_scalar)*>(output_ptr + i) = vec.as_scalar;
   }
-  // TODO: barrier
+
+  barrier_(signal_pads, rank, world_size);
 }
 
 at::Tensor one_shot_all_reduce(
@@ -223,8 +236,7 @@ at::Tensor one_shot_all_reduce(
     std::string reduce_op,
     std::string group_name) {
   TORCH_CHECK(
-      input.is_contiguous(),
-      "one_shot_all_reduce: input must be contiguous.");
+      input.is_contiguous(), "one_shot_all_reduce: input must be contiguous.");
   TORCH_CHECK(
       reduce_op == "sum",
       "one_shot_all_reduce: only sum is supported for now.");
@@ -248,18 +260,32 @@ at::Tensor one_shot_all_reduce(
       num_blocks,
       num_threads);
 
-#define DISPATCH(scalar_t, kernel_alignment)                                   \
-  if (alignment == kernel_alignment) {                                         \
-    one_shot_all_reduce_kernel<scalar_t, kernel_alignment>                     \
-        <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(    \
-            reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev()),     \
-            output.data_ptr<scalar_t>(),                                       \
-            input.storage_offset(),                                            \
-            input.numel(),                                                     \
-            reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev()), \
-            symm_mem->get_rank(),                                              \
-            symm_mem->get_world_size());                                       \
-    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
+#define DISPATCH(scalar_t, kernel_alignment)                                  \
+  if (alignment == kernel_alignment) {                                        \
+    if (symm_mem->get_world_size() == 8) {                                    \
+      one_shot_all_reduce_kernel<scalar_t, kernel_alignment, 8>               \
+          <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>( \
+              reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev()),  \
+              output.data_ptr<scalar_t>(),                                    \
+              input.storage_offset(),                                         \
+              input.numel(),                                                  \
+              reinterpret_cast<uint32_t**>(                                   \
+                  symm_mem->get_signal_pad_ptrs_dev()),                       \
+              symm_mem->get_rank(),                                           \
+              symm_mem->get_world_size());                                    \
+    } else {                                                                  \
+      one_shot_all_reduce_kernel<scalar_t, kernel_alignment, -1>              \
+          <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>( \
+              reinterpret_cast<scalar_t**>(symm_mem->get_buffer_ptrs_dev()),  \
+              output.data_ptr<scalar_t>(),                                    \
+              input.storage_offset(),                                         \
+              input.numel(),                                                  \
+              reinterpret_cast<uint32_t**>(                                   \
+                  symm_mem->get_signal_pad_ptrs_dev()),                       \
+              symm_mem->get_rank(),                                           \
+              symm_mem->get_world_size());                                    \
+    }                                                                         \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                           \
   }
 
   AT_DISPATCH_SWITCH(
