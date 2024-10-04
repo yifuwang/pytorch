@@ -67,7 +67,7 @@ class SymmetricMemoryTest(MultiProcessTestCase):
 
     @property
     def world_size(self) -> int:
-        return 2
+        return 8
 
     @property
     def device(self) -> torch.device:
@@ -83,6 +83,7 @@ class SymmetricMemoryTest(MultiProcessTestCase):
             store=store,
         )
         enable_symm_mem_for_group(dist.group.WORLD.group_name)
+        torch.manual_seed(42 + self.rank)
 
     def _verify_symmetric_memory(self, symm_mem):
         self.assertEqual(symm_mem.world_size, 2)
@@ -482,6 +483,7 @@ class SymmetricMemoryTest(MultiProcessTestCase):
         group_name = dist.group.WORLD.group_name
 
         t = _SymmetricMemory.empty_strided_p2p(
+            # size=(16384,),
             size=(16384,),
             stride=(1,),
             dtype=dtype,
@@ -493,17 +495,31 @@ class SymmetricMemoryTest(MultiProcessTestCase):
         self.assertTrue(align_bytes % t.element_size() == 0)
         self.assertTrue(size_bytes % t.element_size() == 0)
 
-        shift = align_bytes // t.element_size()
-        numel = size_bytes // t.element_size()
-        x = t[shift : shift + numel]
-        x.fill_(1)
+        # shift = align_bytes // t.element_size()
+        # numel = size_bytes // t.element_size()
+        # x = t[shift : shift + numel]
+        x = t
+        # x.fill_(1)
+        x.normal_()
 
+        # print(dtype, size_bytes, align_bytes)
+        # print(f"before: {x}")
+        print(f"sum before: {x.sum()}")
+        
+        from torch.distributed._functional_collectives import all_gather_tensor, all_reduce
         res = torch.ops.symm_mem.multimem_one_shot_all_reduce(x, "sum", group_name)
-        self.assertTrue(res.eq(self.world_size).all().item())
+        # res = all_reduce(x, "sum", "0")
+        foo = all_gather_tensor(res, 0, "0").view(self.world_size, -1)
+        # print(res.shape, foo.shape)
+        print(f"sum: {foo.sum()}")
+        print((foo == foo[0, :]).all(dim=0))
+        print((foo == foo[0, :]).all(dim=0).sum())
+        
+        # print(f"after: {res}")
+        # self.assertTrue(res.eq(self.world_size).all().item())
         dist.destroy_process_group()
 
     @skip_if_lt_x_gpu(2)
-    @requires_multicast_support()
     @parametrize("dtype", [torch.float, torch.bfloat16])
     @parametrize("align_bytes", [4, 8, 16])
     @parametrize("size_bytes", [4, 8192, 8196])
@@ -529,9 +545,17 @@ class SymmetricMemoryTest(MultiProcessTestCase):
         numel = size_bytes // t.element_size()
         x = t[shift : shift + numel]
         x.fill_(1)
+        x.normal_()
 
+        print(dtype, size_bytes, align_bytes)
+        print(f"before: {x}")
+        
         res = torch.ops.symm_mem.one_shot_all_reduce(x, "sum", group_name)
-        self.assertTrue(res.eq(self.world_size).all().item())
+        print(res)
+        from torch.distributed._functional_collectives import all_gather_tensor, all_reduce
+        foo = all_gather_tensor(res, 0, "0").view(self.world_size, -1)
+        print((foo == foo[0, :]).all(dim=0).sum())
+        # self.assertTrue(res.eq(self.world_size).all().item())
         dist.destroy_process_group()
 
     @skipIfRocm

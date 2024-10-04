@@ -183,11 +183,80 @@ static __global__ void multimem_one_shot_all_reduce_kernel(
   auto offset = (blockDim.x * blockIdx.x + threadIdx.x) * numel_per_thread;
   auto stride = blockDim.x * gridDim.x * numel_per_thread;
   for (size_t i = offset; i < numel; i += stride) {
+    // Vec<alignment> vec{};
     auto vec = multimem_ld_reduce_add<alignment>(input_mc_ptr + i);
     *reinterpret_cast<decltype(vec.as_scalar)*>(output_ptr + i) = vec.as_scalar;
+    // st_vec<alignment>(output_ptr + i, vec);
   }
 
   barrier_(signal_pads, rank, world_size);
+}
+
+at::Tensor multimem_one_shot_all_reduce(
+    const at::Tensor& input,
+    std::string reduce_op,
+    std::string group_name) {
+  TORCH_CHECK(
+      input.is_contiguous(),
+      "multimem_one_shot_all_reduce: input must be contiguous.");
+  TORCH_CHECK(
+      reduce_op == "sum",
+      "multimem_one_shot_all_reduce: only sum is supported for now.");
+
+  auto symm_mem = c10d::symmetric_memory::rendezvous(input);
+  TORCH_CHECK(
+      symm_mem != nullptr,
+      "multimem_one_shot_all_reduce: input must be allocated with empty_strided_p2p().");
+  TORCH_CHECK(
+      symm_mem->has_multicast_support(),
+      "multimem_one_shot_all_reduce: requires multicast support.");
+
+  auto output = at::empty_like(input);
+
+  const size_t alignment =
+      get_and_verify_alignment(input, "multimem_one_shot_all_reduce");
+
+
+  int num_blocks = 0, num_threads = 0;
+  init_elementwise_launch_config(
+      input.numel(),
+      input.element_size(),
+      alignment,
+      1,
+      num_blocks,
+      num_threads);
+
+  LOG(INFO) << "alignment: " << alignment << ", num_blocks: " << num_blocks << ", num_threads: " << num_threads;
+
+#define DISPATCH(scalar_t, kernel_alignment)                                   \
+  if (alignment == kernel_alignment) {                                         \
+    multimem_one_shot_all_reduce_kernel<scalar_t, kernel_alignment>            \
+        <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(    \
+            reinterpret_cast<scalar_t*>(symm_mem->get_multicast_ptr()) +       \
+                input.storage_offset(),                                        \
+            output.data_ptr<scalar_t>(),                                       \
+            input.numel(),                                                     \
+            reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev()), \
+            symm_mem->get_rank(),                                              \
+            symm_mem->get_world_size());                                       \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
+  }
+
+  AT_DISPATCH_SWITCH(
+      input.scalar_type(),
+      "multimem_all_reduce",
+      AT_DISPATCH_CASE(at::kBFloat16, [&] {
+        DISPATCH(scalar_t, 16);
+        DISPATCH(scalar_t, 8);
+        DISPATCH(scalar_t, 4);
+      }) AT_DISPATCH_CASE(at::kFloat, [&] {
+        DISPATCH(scalar_t, 16);
+        DISPATCH(scalar_t, 8);
+        DISPATCH(scalar_t, 4);
+      }));
+
+#undef DISPATCH
+  return output;
 }
 
 template <typename T, int alignment, int k_world_size>
@@ -215,6 +284,7 @@ static __global__ void one_shot_all_reduce_kernel(
 #pragma unroll k_world_size
       for (size_t step = 0; step < k_world_size; ++step) {
         size_t remote_rank = (rank + step) % k_world_size;
+        // size_t remote_rank = step;
         auto vec = ld_vec<alignment>(input_ptrs[remote_rank] + input_offset + i);
         acc = add_vec<alignment, T>(acc, vec);
       }
@@ -291,70 +361,6 @@ at::Tensor one_shot_all_reduce(
   AT_DISPATCH_SWITCH(
       input.scalar_type(),
       "one_shot_all_reduce",
-      AT_DISPATCH_CASE(at::kBFloat16, [&] {
-        DISPATCH(scalar_t, 16);
-        DISPATCH(scalar_t, 8);
-        DISPATCH(scalar_t, 4);
-      }) AT_DISPATCH_CASE(at::kFloat, [&] {
-        DISPATCH(scalar_t, 16);
-        DISPATCH(scalar_t, 8);
-        DISPATCH(scalar_t, 4);
-      }));
-
-#undef DISPATCH
-  return output;
-}
-
-at::Tensor multimem_one_shot_all_reduce(
-    const at::Tensor& input,
-    std::string reduce_op,
-    std::string group_name) {
-  TORCH_CHECK(
-      input.is_contiguous(),
-      "multimem_one_shot_all_reduce: input must be contiguous.");
-  TORCH_CHECK(
-      reduce_op == "sum",
-      "multimem_one_shot_all_reduce: only sum is supported for now.");
-
-  auto symm_mem = c10d::symmetric_memory::rendezvous(input);
-  TORCH_CHECK(
-      symm_mem != nullptr,
-      "multimem_one_shot_all_reduce: input must be allocated with empty_strided_p2p().");
-  TORCH_CHECK(
-      symm_mem->has_multicast_support(),
-      "multimem_one_shot_all_reduce: requires multicast support.");
-
-  auto output = at::empty_like(input);
-
-  const size_t alignment =
-      get_and_verify_alignment(input, "multimem_one_shot_all_reduce");
-
-  int num_blocks = 0, num_threads = 0;
-  init_elementwise_launch_config(
-      input.numel(),
-      input.element_size(),
-      alignment,
-      1,
-      num_blocks,
-      num_threads);
-
-#define DISPATCH(scalar_t, kernel_alignment)                                   \
-  if (alignment == kernel_alignment) {                                         \
-    multimem_one_shot_all_reduce_kernel<scalar_t, kernel_alignment>            \
-        <<<num_blocks, num_threads, 0, at::cuda::getCurrentCUDAStream()>>>(    \
-            reinterpret_cast<scalar_t*>(symm_mem->get_multicast_ptr()) +       \
-                input.storage_offset(),                                        \
-            output.data_ptr<scalar_t>(),                                       \
-            input.numel(),                                                     \
-            reinterpret_cast<uint32_t**>(symm_mem->get_signal_pad_ptrs_dev()), \
-            symm_mem->get_rank(),                                              \
-            symm_mem->get_world_size());                                       \
-    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
-  }
-
-  AT_DISPATCH_SWITCH(
-      input.scalar_type(),
-      "multimem_all_reduce",
       AT_DISPATCH_CASE(at::kBFloat16, [&] {
         DISPATCH(scalar_t, 16);
         DISPATCH(scalar_t, 8);

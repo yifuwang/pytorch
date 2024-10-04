@@ -462,55 +462,82 @@ at::Tensor IntraNodeComm::oneShotAllReduce(
     at::cuda::CUDAStream& stream) {
   checkInput(input, deviceIdx_);
 
-  const size_t numelPerWarp =
-      kBytesPerThread / input.element_size() * kWarpSize;
-  const size_t N_aligned = alignUp(input.numel(), numelPerWarp);
-  const bool isAligned = (N_aligned == static_cast<size_t>(input.numel()));
-  TORCH_CHECK(N_aligned <= bufferSize_ / input.element_size());
+  auto op = c10::Dispatcher::singleton().findSchemaOrThrow(
+      "symm_mem::multimem_one_shot_all_reduce", "").typed<at::Tensor (const at::Tensor&, std::string, std::string)>();
 
-  dim3 blocks, threads;
-  getLaunchConfig(N_aligned, input.element_size(), blocks, threads);
+  TORCH_CHECK((void*)symmetricMemoryPtr_ == (void*)symmetricMemory_->get_buffer_ptrs()[rank_]);
 
-  at::cuda::OptionalCUDAGuard guard(input.get_device());
+  // at::cuda::OptionalCUDAGuard guard(input.get_device());
+  // AT_CUDA_CHECK(cudaMemcpyAsync(
+  //     // symmetricMemory_->get_buffer_ptrs()[rank_],
+  //     symmetricMemoryPtr_,
+  //     input.data_ptr(),
+  //     input.numel() * input.element_size(),
+  //     cudaMemcpyDeviceToDevice,
+  //     stream));
 
-  AT_CUDA_CHECK(cudaMemcpyAsync(
-      symmetricMemory_->get_buffer_ptrs()[rank_],
-      input.data_ptr(),
-      input.numel() * input.element_size(),
-      cudaMemcpyDeviceToDevice,
-      stream));
+  auto symmMemTensor = at::from_blob(
+    symmetricMemory_->get_buffer_ptrs()[rank_],
+    // symmetricMemoryPtr_,
+    input.sizes(),
+    at::TensorOptions().dtype(input.dtype()).device(input.device()));
 
-#define X(kWorldSize, kAligned)                            \
-  if (worldSize_ == kWorldSize) {                          \
-    oneShotAllReduceKernel<kWorldSize, kAligned>           \
-        <<<blocks, threads, 0, stream>>>(                  \
-            input.data_ptr<at::BFloat16>(),                \
-            input.numel(),                                 \
-            N_aligned,                                     \
-            reinterpret_cast<P2pState**>(p2pStatesDev_),   \
-            reinterpret_cast<at::BFloat16**>(buffersDev_), \
-            rank_);                                        \
-    C10_CUDA_KERNEL_LAUNCH_CHECK();                        \
-  }
+  symmMemTensor.copy_(input);
 
-#define DISPATCH_ALL_WORLD_SIZES(kAligned) \
-  X(2, kAligned);                          \
-  X(3, kAligned);                          \
-  X(4, kAligned);                          \
-  X(5, kAligned);                          \
-  X(6, kAligned);                          \
-  X(7, kAligned);                          \
-  X(8, kAligned);
-
-  if (isAligned) {
-    DISPATCH_ALL_WORLD_SIZES(true);
-  } else {
-    DISPATCH_ALL_WORLD_SIZES(false);
-  }
-
-#undef DISPATCH_ALL_WORLD_SIZES
-#undef X
+  auto output = op.call(symmMemTensor, "sum", "");
+  input.copy_(output);
   return input;
+
+
+//  const size_t numelPerWarp =
+//      kBytesPerThread / input.element_size() * kWarpSize;
+//  const size_t N_aligned = alignUp(input.numel(), numelPerWarp);
+//  const bool isAligned = (N_aligned == static_cast<size_t>(input.numel()));
+//  TORCH_CHECK(N_aligned <= bufferSize_ / input.element_size());
+//
+//  dim3 blocks, threads;
+//  getLaunchConfig(N_aligned, input.element_size(), blocks, threads);
+//
+//  at::cuda::OptionalCUDAGuard guard(input.get_device());
+//
+//  AT_CUDA_CHECK(cudaMemcpyAsync(
+//      symmetricMemory_->get_buffer_ptrs()[rank_],
+//      input.data_ptr(),
+//      input.numel() * input.element_size(),
+//      cudaMemcpyDeviceToDevice,
+//      stream));
+//
+//#define X(kWorldSize, kAligned)                            \
+//  if (worldSize_ == kWorldSize) {                          \
+//    oneShotAllReduceKernel<kWorldSize, kAligned>           \
+//        <<<blocks, threads, 0, stream>>>(                  \
+//            input.data_ptr<at::BFloat16>(),                \
+//            input.numel(),                                 \
+//            N_aligned,                                     \
+//            reinterpret_cast<P2pState**>(p2pStatesDev_),   \
+//            reinterpret_cast<at::BFloat16**>(buffersDev_), \
+//            rank_);                                        \
+//    C10_CUDA_KERNEL_LAUNCH_CHECK();                        \
+//  }
+//
+//#define DISPATCH_ALL_WORLD_SIZES(kAligned) \
+//  X(2, kAligned);                          \
+//  X(3, kAligned);                          \
+//  X(4, kAligned);                          \
+//  X(5, kAligned);                          \
+//  X(6, kAligned);                          \
+//  X(7, kAligned);                          \
+//  X(8, kAligned);
+//
+//  if (isAligned) {
+//    DISPATCH_ALL_WORLD_SIZES(true);
+//  } else {
+//    DISPATCH_ALL_WORLD_SIZES(false);
+//  }
+//
+//#undef DISPATCH_ALL_WORLD_SIZES
+//#undef X
+//  return input;
 }
 
 at::Tensor IntraNodeComm::twoShotAllReduce(

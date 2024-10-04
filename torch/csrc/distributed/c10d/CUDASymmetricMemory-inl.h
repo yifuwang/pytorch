@@ -219,7 +219,7 @@ __device__ __inline__ Vec<Alignment> multimem_ld_reduce_add(T* mc_ptr) {
     __device__ __inline__ Vec<Alignment> operator()(type* mc_ptr) {            \
       Vec<Alignment> vec;                                                      \
       if constexpr (Alignment == 16) {                                         \
-        asm("multimem.ld_reduce.relaxed.sys.global.add.v4." asm_type           \
+        asm("multimem.ld_reduce.relaxed.sys.global.add.acc::f32.v4.bf16x2"     \
             " {%0,%1,%2,%3}, [%4];"                                            \
             : "=r"(vec.u32[0]),                                                \
               "=r"(vec.u32[1]),                                                \
@@ -243,6 +243,7 @@ __device__ __inline__ Vec<Alignment> multimem_ld_reduce_add(T* mc_ptr) {
     }                                                                          \
   };
 #endif
+// TODO: else
 
 SPECIALIZE_MULTIMEM_LD_REDUCE_VEC_32(at::BFloat16, "bf16x2");
 SPECIALIZE_MULTIMEM_LD_REDUCE_VEC_32(float, "f32");
@@ -282,25 +283,24 @@ __device__ __inline__ Vec<Alignment> ld_vec(const T* addr) {
 #if defined(USE_ROCM) || (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 800))
   CUDA_KERNEL_ASSERT(false);
 #else
-  Vec<Alignment> vec {};
+  Vec<Alignment> vec;
   if constexpr (Alignment == 16) {
-    asm("ld.global.v4.u32 {%1,%2,%3,%4}, [%0];"
-        :
-        : "l"(addr),
-          "r"(vec.u32[0]),
-          "r"(vec.u32[1]),
-          "r"(vec.u32[2]),
-          "r"(vec.u32[3])
+    asm("ld.global.v4.u32 {%0,%1,%2,%3}, [%4];"
+        : "=r"(vec.u32[0]),
+          "=r"(vec.u32[1]),
+          "=r"(vec.u32[2]),
+          "=r"(vec.u32[3])
+        : "l"(addr)
         : "memory");
   } else if constexpr (Alignment == 8) {
-    asm("ld.global.v2.u32 {%1,%2}, [%0];"
-        :
-        : "l"(addr), "r"(vec.u32[0]), "r"(vec.u32[1])
+    asm("ld.global.v2.u32 {%0,%1}, [%2];"
+        : "=r"(vec.u32[0]), "=r"(vec.u32[1])
+        : "l"(addr)
         : "memory");
   } else if constexpr (Alignment == 4) {
-    asm("ld.global.u32 %1, [%0];"
-        :
-        : "l"(addr), "r"(vec.u32)
+    asm("ld.global.u32 %0, [%1];"
+        : "=r"(vec.u32)
+        : "l"(addr)
         : "memory");
   } else {
     static_assert(dependent_false<T>);
@@ -357,7 +357,7 @@ __device__ __inline__ T add_bf16x2(T a, T b) {
 }
 
 template <int Alignment, typename T>
-__device__ __inline__ Vec<Alignment> add_vec(Vec<Alignment>& a, Vec<Alignment>& b) {
+__device__ __inline__ Vec<Alignment> add_vec(const Vec<Alignment>& a, const Vec<Alignment>& b) {
   Vec<Alignment> c{};
   if constexpr (std::is_same_v<T, float>) {
     if constexpr (Alignment == 16) {
