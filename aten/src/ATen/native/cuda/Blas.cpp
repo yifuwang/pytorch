@@ -40,6 +40,7 @@
 #include <ATen/ops/ones.h>
 #include <ATen/ops/scalar_tensor_native.h>
 #include <ATen/ops/vdot_native.h>
+#include <ATen/ops/zeros.h>
 #endif
 
 namespace at::native {
@@ -1154,6 +1155,7 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
   }
   else
 #endif
+  auto counters = at::ones(8, at::TensorOptions().dtype(at::kInt).device(mat1.device()));
   {
     at::cuda::blas::scaled_gemm(
         args.transa,
@@ -1175,7 +1177,8 @@ _scaled_mm_out_cuda(const Tensor& mat1, const Tensor& mat2,
         scale_result ? scale_result->data_ptr() : nullptr,
         args.result_ld,
         out_dtype_,
-        use_fast_accum);
+        use_fast_accum,
+        reinterpret_cast<uint32_t*>(counters.data_ptr()));
   }
 
   return out;

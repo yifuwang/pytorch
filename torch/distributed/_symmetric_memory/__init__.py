@@ -429,7 +429,7 @@ def _fused_all_gather_scaled_matmul_fallback(
     ) -> torch.Tensor:
         leading_dims = A.shape[:-1]
         res = torch.ops.aten._scaled_mm(
-            A.flatten(0, -2), B, A_scale, B_scale, out_dtype=out_dtype
+            A.flatten(0, -2), B, A_scale, B_scale, out_dtype=out_dtype, use_fast_accum=use_fast_accum
         )
         return res.unflatten(0, leading_dims)
 
