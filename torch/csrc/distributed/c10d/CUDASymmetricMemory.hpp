@@ -53,6 +53,8 @@ class CUDASymmetricMemory : public SymmetricMemory {
   int get_world_size() override;
 
   void stream_write_value32(uintptr_t addr, uint32_t val) override;
+  void stream_wait_value32(uintptr_t addr, uint32_t val) override;
+  void memset32(uintptr_t addr, uint32_t val) override;
 
  private:
   std::vector<HandleType> handles_;

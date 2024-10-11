@@ -31,6 +31,7 @@
   _(cuMemExportToShareableHandle)   \
   _(cuMemImportFromShareableHandle) \
   _(cuStreamWriteValue32)           \
+  _(cuStreamWaitValue32)            \
   _(cuGetErrorString)
 
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 12030)

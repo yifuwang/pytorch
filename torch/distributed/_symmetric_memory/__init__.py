@@ -208,13 +208,21 @@ def _pipelined_multi_all_gather_and_consume(
 
     # While consuming the local shard, copy it to the local p2p buffer in
     # another stream.
-    shard_consumer(shard, rank)
-    copy_shard(dst=shards[rank], src=shard)
+    # caveat: contention
+    # Since the local shard is ready, we can consume it right away without
+    # waiting for anything. While doing so, we want to copy the data to the p2p
+    # buffer in the backend stream.
 
+    signal_stream = _get_signal_stream()
     with torch.cuda.stream(backend_stream):
         copy_shard(dst=local_p2p_bufs, src=shard)
-        symm_mem.barrier(channel=1)
+        with torch.cuda.stream(signal_stream):
+            signal_stream.wait_stream(backend_stream)
+            symm_mem.barrier(channel=1)
+        backend_stream.wait_stream(signal_stream)
     torch.cuda.current_stream().wait_stream(backend_stream)
+
+    shard_consumer(shard, rank)
 
     # At this point, all ranks have copied their local shard to
     # their local p2p buffer. Each rank can now copy and consume
@@ -229,6 +237,13 @@ def _pipelined_multi_all_gather_and_consume(
         with torch.cuda.stream(stream):
             copy_shard(dst=shards[remote_rank], src=remote_p2p_bufs)
             shard_consumer(shards[remote_rank], remote_rank)
+
+    if group_size % 2 == 0:
+        stream = torch.cuda.current_stream()
+    else:
+        stream = backend_stream
+    with torch.cuda.stream(stream):
+        copy_shard(dst=shards[rank], src=shard)
 
     torch.cuda.current_stream().wait_stream(backend_stream)
     symm_mem.barrier(channel=0)
@@ -301,6 +316,7 @@ def _pipelined_produce_and_all2all(
 
     for step in range(1, group_size):
         remote_rank = (rank - step) % group_size
+        src_rank = (rank + step) % group_size
         if step % 2 == 0:
             stream = torch.cuda.current_stream()
             other_stream = backend_stream
@@ -313,11 +329,16 @@ def _pipelined_produce_and_all2all(
             remote_p2p_buf = get_p2p_buf(remote_rank, 0)
         with torch.cuda.stream(stream):
             chunk_producer((rank + step) % group_size, p2p_buf)
-            symm_mem.barrier(channel=step % 2)
+            # symm_mem.stream_write_value32(local_p2p_buf_0.data_ptr(), 1)
+            # symm_mem.barrier(channel=step % 2)
+            foo = output.new_empty(10)
+            # symm_mem.stream_write_value32(int(foo.data_ptr()), 1)
+            symm_mem.stream_wait_value32(int(p2p_buf.data_ptr()), 1)
+
             # Make the other stream to wait for the barrier on the current
             # stream to finish before chunk_producer to avoid the compute
             # delaying the barrier.
-            other_stream.wait_stream(stream)
+            # other_stream.wait_stream(stream)
             out_chunks[remote_rank].copy_(remote_p2p_buf)
 
     chunk_producer(rank, out_chunks[rank])

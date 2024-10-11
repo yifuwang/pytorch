@@ -1096,6 +1096,16 @@ This class does not support ``__members__`` property.)");
           "stream_write_value32",
           &SymmetricMemory::stream_write_value32,
           py::arg("addr"),
+          py::arg("val"))
+      .def(
+          "stream_wait_value32",
+          &SymmetricMemory::stream_wait_value32,
+          py::arg("addr"),
+          py::arg("val"))
+      .def(
+          "memset32",
+          &SymmetricMemory::stream_wait_value32,
+          py::arg("addr"),
           py::arg("val"));
 
   auto store =

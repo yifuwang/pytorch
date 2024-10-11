@@ -559,6 +559,30 @@ void CUDASymmetricMemory::stream_write_value32(uintptr_t addr, uint32_t val) {
 #endif
 }
 
+void CUDASymmetricMemory::stream_wait_value32(uintptr_t addr, uint32_t val) {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  auto driver_api = c10::cuda::DriverAPI::get();
+  C10_CUDA_DRIVER_CHECK(
+    driver_api->cuStreamWaitValue32_(
+        at::cuda::getCurrentCUDAStream(),
+        reinterpret_cast<CUdeviceptr>((void*)addr),
+        val,
+        0));
+#else
+  TORCH_CHECK(
+      false, "CUDASymmetricMemory requires PYTORCH_C10_DRIVER_API_SUPPORTED");
+#endif
+}
+
+void CUDASymmetricMemory::memset32(uintptr_t addr, uint32_t val) {
+#if !defined(USE_ROCM) && defined(PYTORCH_C10_DRIVER_API_SUPPORTED)
+  C10_CUDA_CHECK(cudaMemsetAsync(reinterpret_cast<void*>(addr), val, sizeof(val)));
+#else
+  TORCH_CHECK(
+      false, "CUDASymmetricMemory requires PYTORCH_C10_DRIVER_API_SUPPORTED");
+#endif
+}
+
 void* CUDASymmetricMemoryAllocator::alloc(
     size_t size,
     int device_idx,
