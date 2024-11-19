@@ -1676,4 +1676,87 @@ def all_gather_scaled_matmul(  # type: ignore[no-untyped-def]
         return all_gather_res, matmul_res[0]
 
 
-__all__ = ["empty", "rendezvous", "all_gather_scaled_matmul"]
+def scaled_matmul_reduce_scatter(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scale: torch.Tensor,
+    B_scale: torch.Tensor,
+    *,
+    group: Union[str, "ProcessGroup"],
+    reduce_op: str = "sum",
+    scatter_dim: int = 0,
+    bias: Optional[torch.Tensor] = None,
+    result_scale: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    use_fast_accum: bool = False,
+) -> torch.Tensor:
+    r"""
+    All-gather :attr:`A_shard` along :attr:`gather_dim`, and then perform scaled matmul
+    on the all-gather result and :attr:`B`. When applicable, this function
+    micro-pipelines the all-gather communication and the scaled matmul computation. This
+    function is semantically equivalent to the following pseudocode::
+
+    Perform scaled matmul on :attr:`A` and :attr:`B`, and then reduce-scatter the result
+    along :attr:`scatter` dim using :attr:`reduce_op`. When applicable, this function
+    micro-pipelines the all-gather communication and the scaled matmul computation. This
+    function is semantically equivalent to the following pseudocode::
+
+        C = torch._scaled_mm(A, B, A_scale, B_scale, ...)
+        reduce_scatter_tensor(C, ...)
+
+    Arguments:
+        A (Tensor): the rhs tensor of the scaled matmul.
+
+        B (Tensor): the rhs tensor of the scaled matmul.
+
+        A_scale (Tensor): the lhs scale of the scaled matmul.
+
+        B_scale (Tensor): the rhs scale of the scaled matmul.
+
+    Keyword args:
+        group (str | ProcessGroup): the process group with which the scaled matmul
+            result is all-gathered. This can be either a group name or a process group
+            object. Devices in the group must be connected via interconnects supported
+            by symmetric memory (e.g. NVLink).
+
+        scatter_dim (int, optional): the dimension along which the scaled_matmul result
+            is reduce_scattered.
+
+        bias (Tensor, optional): the :attr:`bias` argument of :func:`torch._scaled_mm`.
+
+        result_scale (Tensor, optional): the :attr:`result_scale` argument of
+            :func:`torch._scaled_mm`.
+
+        out_dtype (torch.dtype, optional): the :attr:`out_dtype` argument of
+            :func:`torch._scaled_mm`.
+
+        use_fast_accum (bool): the :attr:`use_fast_accum` argument of
+            :func:`torch._scaled_mm`.
+    """
+    if isinstance(group, str):
+        group_name = group
+    elif isinstance(group, ProcessGroup):
+        group_name = group.group_name
+    else:
+        raise TypeError(f"Invalid group type: {type(group)}.")
+
+    return torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter(
+        A,
+        B,
+        A_scale,
+        B_scale,
+        scatter_dim=scatter_dim,
+        group_name=group_name,
+        biases=bias,
+        result_scales=result_scale,
+        out_dtypes=out_dtype,
+        use_fast_accum=use_fast_accum,
+    )
+
+
+__all__ = [
+    "empty",
+    "rendezvous",
+    "all_gather_scaled_matmul",
+    "scaled_matmul_reduce_scatter",
+]
