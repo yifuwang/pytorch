@@ -17,50 +17,51 @@ _group_name_to_store: Dict[str, c10d.Store] = {}
 
 
 def enable_symm_mem_for_group(group_name: str) -> None:
-    """
-    Enables symmetric memory for a process group.
+    # """
+    # Enables symmetric memory for a process group.
 
-    Args:
-        group_name (str): the name of the process group.
-    """
-    if group_name in _group_name_to_store:
-        return
+    # Args:
+    #     group_name (str): the name of the process group.
+    # """
+    # if group_name in _group_name_to_store:
+    #     return
 
-    group = c10d._resolve_process_group(group_name)
-    global_ranks = sorted(c10d._world.pg_group_ranks[group].keys())
-    # Different subgroups with the same name should use different stores
-    global_ranks_str = "_".join(map(str, global_ranks))
-    store = c10d.PrefixStore(
-        f"symmetric_memory-{global_ranks_str}",
-        c10d._get_process_group_store(group),
-    )
-    # Use one store-based broadcast to bootstrap a file store from the process
-    # and simultaneously verify that all ranks are on the same host.
-    hostname = socket.gethostname()
-    if group.rank() == 0:
-        uid = str(uuid.uuid4())
-        msg = f"{hostname}/{uid}"
-        store.set("init", msg)
-    else:
-        msg = store.get("init").decode("utf-8")
-        tokens = msg.split("/")
-        assert len(tokens) == 2, tokens
-        rank_0_hostname, uid = tokens
-        if hostname != rank_0_hostname:
-            raise RuntimeError(
-                "init_symmetric_memory_for_process_group() failed for "
-                f'group "{group_name}". Rank 0 and rank {group.rank()} '
-                f"are on different hosts ({rank_0_hostname} and {hostname})"
-            )
-    store = torch._C._distributed_c10d.FileStore(f"/tmp/{uid}", group.size())
-    # TODO: check device connectiivity
-    _group_name_to_store[group_name] = store
-    _SymmetricMemory.set_group_info(
-        group_name,
-        group.rank(),
-        group.size(),
-        store,
-    )
+    # group = c10d._resolve_process_group(group_name)
+    # global_ranks = sorted(c10d._world.pg_group_ranks[group].keys())
+    # # Different subgroups with the same name should use different stores
+    # global_ranks_str = "_".join(map(str, global_ranks))
+    # store = c10d.PrefixStore(
+    #     f"symmetric_memory-{global_ranks_str}",
+    #     c10d._get_process_group_store(group),
+    # )
+    # # Use one store-based broadcast to bootstrap a file store from the process
+    # # and simultaneously verify that all ranks are on the same host.
+    # hostname = socket.gethostname()
+    # if group.rank() == 0:
+    #     uid = str(uuid.uuid4())
+    #     msg = f"{hostname}/{uid}"
+    #     store.set("init", msg)
+    # else:
+    #     msg = store.get("init").decode("utf-8")
+    #     tokens = msg.split("/")
+    #     assert len(tokens) == 2, tokens
+    #     rank_0_hostname, uid = tokens
+    #     if hostname != rank_0_hostname:
+    #         raise RuntimeError(
+    #             "init_symmetric_memory_for_process_group() failed for "
+    #             f'group "{group_name}". Rank 0 and rank {group.rank()} '
+    #             f"are on different hosts ({rank_0_hostname} and {hostname})"
+    #         )
+    # store = torch._C._distributed_c10d.FileStore(f"/tmp/{uid}", group.size())
+    # # TODO: check device connectiivity
+    # _group_name_to_store[group_name] = store
+    # _SymmetricMemory.set_group_info(
+    #     group_name,
+    #     group.rank(),
+    #     group.size(),
+    #     store,
+    # )
+    return
 
 
 _is_test_mode: bool = False
@@ -93,10 +94,90 @@ def is_symm_mem_enabled_for_group(group_name: str) -> bool:
     return _is_test_mode or group_name in _group_name_to_store
 
 
+_is_symm_mem_boostrapped: Dict[str, bool] = {}
+
+
+def _ensure_symm_mem_bootstrapped(group_name: str, device: torch.device) -> bool:
+    from torch._C._autograd import DeviceType
+    from torch._C._distributed_c10d import _detect_dma_connectivity
+    global _is_symm_mem_boostrapped
+
+    if device.type != "cuda":
+        raise Exception("foo")
+        return False
+
+    if group_name in _is_symm_mem_boostrapped:
+        raise Exception("bar")
+        return _is_symm_mem_boostrapped[group_name]
+
+    # TODO: handle invalid group
+    group = c10d._resolve_process_group(group_name)
+    if group is None:
+        raise ValueError(f"Can not resolve process group with name {group_name}")
+
+    # Different subgroups with the same name should use different stores
+    global_ranks = sorted(c10d._world.pg_group_ranks[group].keys())
+    global_ranks_str = "_".join(map(str, global_ranks))
+    store = c10d.PrefixStore(
+        f"symm_mem_bootstrap-{global_ranks_str}",
+        c10d._get_process_group_store(group),
+    )
+
+    uid = ""
+    hostname = socket.gethostname()
+    if group.rank() == 0:
+        hostnames = [hostname]
+        device_indices = [device.index]
+
+        # Gather hostnames and device indices from peers
+        for rank in range(1, group.size()):
+            msg = store.get(str(rank)).decode("utf-8")
+            tokens = msg.split("/")
+            assert len(tokens) == 2, tokens
+
+            hostnames.append(tokens[0])
+            device_indices.append(int(tokens[1]))
+
+        symm_mem_available = all(hn == hostname for hn in hostnames)
+        if symm_mem_available:
+            conn_matrix = _detect_dma_connectivity(DeviceType.CUDA, "nvlink").matrix
+            for i in device_indices:
+                for j in device_indices:
+                    if i != j and conn_matrix[i][j] == 0:
+                        raise Exception("bar")
+                        symm_mem_available = False
+
+        if not symm_mem_available:
+            store.set("uid", "")
+        else:
+            uid = str(uuid.uuid4())
+            store.set("uid", uid)
+    else:
+        store.set(str(group.rank()), f"{hostname}/{device.index}")
+        uid = store.get("uid").decode("utf-8")
+
+    if uid == "":
+        _is_symm_mem_boostrapped[group_name] = False
+        raise Exception("bar")
+        return False
+
+    local_store = torch._C._distributed_c10d.FileStore(f"/tmp/{uid}", group.size())
+    _SymmetricMemory.set_group_info(
+        group_name,
+        group.rank(),
+        group.size(),
+        local_store,
+    )
+    _is_symm_mem_boostrapped[group_name] = True
+    return True
+
+
 _group_name_to_workspace_tensor: Dict[str, Optional[torch.Tensor]] = {}
 
 
-def get_symm_mem_workspace(group_name: str, min_size: int) -> _SymmetricMemory:
+def get_symm_mem_workspace(
+    group_name: str, min_size: int, device: Optional[torch.device] = None
+) -> _SymmetricMemory:
     """
     Get the symmetric memory workspace associated with the process group. If
     ``min_size`` is greater than the workspace associated with ``group_name``,
@@ -110,7 +191,10 @@ def get_symm_mem_workspace(group_name: str, min_size: int) -> _SymmetricMemory:
         _SymmetricMemory: the symmetric memory workspace associated with the
         group.
     """
-    enable_symm_mem_for_group(group_name)
+    if device is None:
+        # TODO: warning
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # _ensure_symm_mem_bootstrapped(group_name, device)
 
     tensor = _group_name_to_workspace_tensor.get(group_name)
     size = tensor.numel() * tensor.element_size() if tensor is not None else 0
@@ -130,7 +214,7 @@ def get_symm_mem_workspace(group_name: str, min_size: int) -> _SymmetricMemory:
             (max(size, min_size),),
             [1],
             torch.uint8,
-            torch.device(f"cuda:{torch.cuda.current_device()}"),
+            device,
             group_name,
         )
         _group_name_to_workspace_tensor[group_name] = tensor
@@ -172,7 +256,9 @@ def _pipelined_multi_all_gather_and_consume(
     p2p_workspace_size_req = 0
     for x in shard:
         p2p_workspace_size_req += x.numel() * x.element_size()
-    symm_mem = get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    symm_mem = get_symm_mem_workspace(
+        group_name, min_size=p2p_workspace_size_req, device=shard[0].device
+    )
     group_size = symm_mem.world_size
     rank = symm_mem.rank
 
@@ -334,7 +420,9 @@ def _pipelined_produce_and_all2all(
     """
     out_chunks = output.chunk(c10d._get_group_size_by_name(group_name))
     p2p_workspace_size_req = out_chunks[0].numel() * out_chunks[0].element_size() * 2
-    symm_mem = get_symm_mem_workspace(group_name, min_size=p2p_workspace_size_req)
+    symm_mem = get_symm_mem_workspace(
+        group_name, min_size=p2p_workspace_size_req, device=output.device
+    )
     group_size = symm_mem.world_size
     rank = symm_mem.rank
 
@@ -667,10 +755,12 @@ def _fused_all_gather_matmul_native(
     B: torch.Tensor,
     group_name: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    symm_mem = _SymmetricMemory.rendezvous(A_shard)
+    symm_mem = rendezvous(A_shard, group_name)
     if symm_mem is None:
         symm_mem = get_symm_mem_workspace(
-            group_name, A_shard.numel() * A_shard.element_size()
+            group_name,
+            A_shard.numel() * A_shard.element_size(),
+            device=A_shard.device,
         )
         symm_mem.barrier()
         buf = symm_mem.get_buffer(symm_mem.rank, A_shard.shape, A_shard.dtype)
@@ -1484,7 +1574,9 @@ def rendezvous(
     else:
         raise TypeError(f"rendezvous: unsupported group type: {type(group)}")
 
-    enable_symm_mem_for_group(group_name)
+    # enable_symm_mem_for_group(group_name)
+    # TODO: check(?)
+    _ensure_symm_mem_bootstrapped(group_name, tensor.device)
     return _SymmetricMemory.rendezvous(tensor, group_name)
 
 

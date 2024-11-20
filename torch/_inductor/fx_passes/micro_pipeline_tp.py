@@ -527,6 +527,7 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
     c10d = torch.ops._c10d_functional
     from torch.distributed._symmetric_memory import (
         is_symm_mem_enabled_for_group,
+        _ensure_symm_mem_bootstrapped,
         restride_A_shard_for_fused_all_gather_matmul,
     )
 
@@ -538,7 +539,9 @@ def fuse_all_gather_matmul(all_gather: _AllGatherMatch) -> None:
         all_gather.group_name,
     )
 
-    if not is_symm_mem_enabled_for_group(group_name):
+    device = shard_node.meta["val"].device
+
+    if not _ensure_symm_mem_bootstrapped(group_name, device):
         return
 
     if gather_dim >= len(_get_tensor(shard_node).shape) - 1:
