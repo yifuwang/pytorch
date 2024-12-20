@@ -468,6 +468,7 @@ lib.define("_low_contention_all_gather(Tensor tensor, str group_name) -> Tensor"
 lib.define(
     "_low_contention_reduce_scatter(Tensor tensor, str reduce_op, str group_name) -> Tensor"
 )
+lib.define("_multimem_all_gather_out_async(Tensor tensor, str group_name, Tensor(a!) out) -> Tensor(a!)")
 
 
 class _ScaleMode(Enum):
@@ -1501,6 +1502,29 @@ def _low_contention_reduce_scatter(
         return _low_contention_reduce_scatter_with_workspace(
             tensor, reduce_op, workspace
         )
+
+
+@torch.library.impl(lib, "_multimem_all_gather_out_async", "Meta")
+def _multimem_all_gather_out_async_meta(
+    tensor: torch.Tensor,
+    group_name: str,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    return torch.empty_like(out)
+
+
+@torch.library.impl(lib, "_multimem_all_gather_out_async", "CUDA")
+def _multimem_all_gather_out_async(
+    tensor: torch.Tensor,
+    group_name: str,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    stream = _get_backend_stream(priority=-1)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.ops.symm_mem.multimem_all_gather_out(tensor, group_name, out)
+        torch._C._distributed_c10d._register_work(out, Work())
+    return out
 
 
 # =============================================================================

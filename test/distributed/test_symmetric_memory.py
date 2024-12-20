@@ -1033,6 +1033,61 @@ class LoweringTest(MultiProcessTestCase):
         self.assertIn("one_shot_all_reduce", code_3)
         self.assertNotIn("return (buf0", code_3)
 
+    @skipIfRocm  # requires registered-buffer support
+    @skip_if_lt_x_gpu(2)
+    @fresh_inductor_cache()
+    def test_lowering_multimem_all_gather(self):
+        self._init_process()
+
+        arg = torch.rand(4, 4, device=self.device)
+
+        def func_0(x):
+            x = x + 1
+            y = torch.ops._c10d_functional.all_gather_into_tensor(x, 2, "0")
+            return torch.ops._c10d_functional.wait_tensor(y)
+
+        compiled_0 = torch.compile(func_0, fullgraph=True)
+        code_0 = run_and_get_triton_code(compiled_0, arg)
+        print(code_0)
+
+        # self.assertIn("one_shot_all_reduce", code_0)
+        # self.assertNotIn("return (buf0", code_0)
+
+        # # All-reduce on a slice view
+        # def func_1(x):
+        #     x = x + 1
+        #     x = x[2:]
+        #     x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
+        #     return torch.ops._c10d_functional.wait_tensor(x)
+
+        # compiled_1 = torch.compile(func_1, fullgraph=True)
+        # code_1 = run_and_get_triton_code(compiled_1, arg)
+
+        # self.assertIn("one_shot_all_reduce", code_1)
+        # self.assertNotIn("return (buf0", code_1)
+
+        # # All-reduce on input
+        # def func_2(x):
+        #     x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
+        #     return torch.ops._c10d_functional.wait_tensor(x)
+
+        # compiled_2 = torch.compile(func_2, fullgraph=True)
+        # code_2 = run_and_get_triton_code(compiled_2, arg)
+
+        # self.assertNotIn("one_shot_all_reduce", code_2)
+
+        # # All-reduce on matmul output
+        # def func_3(x):
+        #     x = x @ x
+        #     x = torch.ops._c10d_functional.all_reduce(x, "sum", "0")
+        #     return torch.ops._c10d_functional.wait_tensor(x)
+
+        # compiled_3 = torch.compile(func_3, fullgraph=True)
+        # code_3 = run_and_get_triton_code(compiled_3, arg)
+
+        # self.assertIn("one_shot_all_reduce", code_3)
+        # self.assertNotIn("return (buf0", code_3)
+
 
 class SymmMemSingleProcTest(TestCase):
     @skipIfRocm

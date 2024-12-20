@@ -167,6 +167,19 @@ def _one_shot_all_reduce(inp: ir.TensorBox, reduce_op, group_name):
         ),
     )
 
+def _multimem_all_gather_out(inp: ir.TensorBox, group_name, out: ir.TensorBox):
+    # realize_as_comm_buffer(inp, ir.CommBufferType.SYMM_MEM, group_name)
+    # return pytree.tree_map(
+    #     ir.TensorBox.create,
+    #     ir.FallbackKernel.create(
+    #         torch.ops.symm_mem.one_shot_all_reduce.default,
+    #         inp,
+    #         reduce_op,
+    #         group_name,
+    #     ),
+    # )
+    pass
+
 
 def register_comm_lowerings():
     try:
@@ -244,7 +257,31 @@ def register_comm_lowerings():
         return inputs
 
     @register_lowering(c10d.all_gather_into_tensor)
-    def _all_gather_into_tensor(inp, group_size, group_name):
+    def _all_gather_into_tensor(inp: ir.TensorBox, group_size, group_name):
+        from .lowering import new_empty
+        out_shape = list(inp.shape)
+        out_shape[0] *= group_size
+
+        out = new_empty(
+            inp,
+            out_shape,
+        )
+        out.data.data.layout = ir.FlexibleLayout(
+            device=out.get_device(),
+            dtype=out.get_dtype(),
+            size=out_shape,
+        )
+        realize_as_comm_buffer(out, ir.CommBufferType.SYMM_MEM, group_name)
+        return pytree.tree_map(
+            ir.TensorBox.create,
+            ir._CollectiveKernel.create_out_of_place(
+                torch.ops.symm_mem._multimem_all_gather_out_async.default,
+                inp,
+                group_name,
+                out,
+            )
+        )
+
         return ir.TensorBox.create(
             ir._CollectiveKernel.create_out_of_place(
                 c10d.all_gather_into_tensor.default,

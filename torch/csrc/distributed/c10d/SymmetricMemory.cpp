@@ -217,6 +217,13 @@ at::Tensor one_shot_all_reduce_meta(
   return at::empty_like(input);
 }
 
+at::Tensor multimem_all_gather_out_meta(
+    const at::Tensor& input,
+    std::string group_name,
+    at::Tensor out) {
+  return at::empty_like(out);
+}
+
 TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
   m.def(
       "multimem_all_reduce_(Tensor(a!) input, str reduce_op, str group_name) -> Tensor(a!)");
@@ -252,6 +259,7 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
 
 TORCH_LIBRARY_IMPL(symm_mem, Meta, m) {
   m.impl("one_shot_all_reduce", one_shot_all_reduce_meta);
+  m.impl("multimem_all_gather_out", multimem_all_gather_out_meta);
 }
 
 } // namespace
