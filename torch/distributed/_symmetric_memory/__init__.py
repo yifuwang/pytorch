@@ -650,6 +650,59 @@ def _fused_all_gather_matmul_fallback(
         return None, res
 
 
+class _AllGatherMatmulAlgo(Enum):
+    MULTICAST = 0
+    NATIVE = 1
+    DECOMPOSE = 2
+
+
+def _select_all_gather_matmul_algo(
+    A_shard: torch.Tensor,
+    Bs: List[torch.Tensor],
+    gather_dim: int,
+    group_name: str,
+    return_A: bool,
+) -> _AllGatherMatmulAlgo:
+    group = c10d._resolve_process_group(group_name)
+    local_M = math.prod(A_shard.shape[:-1])
+    K = A_shard.shape[-1]
+    Ns = [B.shape[1] for B in Bs]
+
+    intensity = sum(local_M * N * K / (local_M * K + N * K + local_M * N) for N in Ns)
+    has_multicast_support = (
+        A_shard.device.type == "cuda"
+        and _SymmetricMemory.has_multicast_support(
+            DeviceType.CUDA, A_shard.device.index
+        )
+    )
+
+    # print(intensity, has_multicast_support, return_A, A_shard.is_contiguous(), gather_dim)
+    if (
+        intensity < 400
+        and has_multicast_support
+        and not return_A
+        # and A_shard.is_contiguous()
+        and gather_dim == 0
+    ):
+        return _AllGatherMatmulAlgo.MULTICAST
+
+    if (
+        "TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP" in os.environ
+        and A_shard.is_contiguous()
+        and gather_dim == 0
+        # _async_input_mm requires local_M to be divisible by world_size.
+        and local_M % group.size() == 0
+        # _async_input_mm outperforms the decomposition-based approach when the
+        # global M is small.
+        and local_M * group.size() <= 8192
+        # _async_input_mm only supports a single B.
+        and len(Bs) == 1
+    ):
+        return _AllGatherMatmulAlgo.NATIVE
+
+    return _AllGatherMatmulAlgo.DECOMPOSE
+
+
 @torch.library.impl(lib, "fused_all_gather_matmul", "CUDA")
 def _fused_all_gather_matmul(
     A_shard: torch.Tensor,
@@ -674,49 +727,27 @@ def _fused_all_gather_matmul(
             A_shard, Bs, gather_dim, group_name, return_A=return_A
         )
 
-    if _should_use_fused_all_gather_matmul_native(A_shard, Bs, gather_dim, group_name):
-        return _fused_all_gather_matmul_native(A_shard, Bs[0], group_name)
-
-    if _should_use_multimem_all_gather_matmul(
-        A_shard, gather_dim, group_name, return_A
-    ):
+    algo = _select_all_gather_matmul_algo(A_shard, Bs, gather_dim, group_name, return_A)
+    if algo == _AllGatherMatmulAlgo.MULTICAST:
+        # TODO: contiguity
         return None, _multimem_all_gather_matmul(A_shard, Bs, group_name)
-
-    with torch.profiler.record_function("fused_all_gather_matmul"):
-        return _fused_all_gather_matmul_impl(
-            torch.ops.aten.mm.out,
-            A_shard,
-            Bs,
-            None,
-            [{} for B in Bs],
-            [B.dtype for B in Bs],
-            gather_dim,
-            group_name,
-            return_A,
+    elif algo == _AllGatherMatmulAlgo.NATIVE:
+        return _fused_all_gather_matmul_native(
+            A_shard, Bs[0], group_name
         )
-
-
-def _should_use_fused_all_gather_matmul_native(
-    A_shard: torch.Tensor,
-    Bs: List[torch.Tensor],
-    gather_dim: int,
-    group_name: str,
-) -> bool:
-    group = c10d._resolve_process_group(group_name)
-    local_M = math.prod(A_shard.shape[:-1])
-
-    return (
-        "TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP" in os.environ
-        and A_shard.is_contiguous()
-        and gather_dim == 0
-        # _async_input_mm requires local_M to be divisible by world_size.
-        and local_M % group.size() == 0
-        # _async_input_mm outperforms the decomposition-based approach when the
-        # global M is small.
-        and 2048 < local_M * group.size() <= 4096
-        # _async_input_mm only supports a single B.
-        and len(Bs) == 1
-    )
+    else:
+        with torch.profiler.record_function("fused_all_gather_matmul"):
+            return _fused_all_gather_matmul_impl(
+                torch.ops.aten.mm.out,
+                A_shard,
+                Bs,
+                None,
+                [{} for B in Bs],
+                [B.dtype for B in Bs],
+                gather_dim,
+                group_name,
+                return_A,
+            )
 
 
 def _fused_all_gather_matmul_native(
