@@ -271,24 +271,37 @@ at::Tensor async_input_mm_out(
 
 #if defined(BUILD_ASYNC_MM_KERNEL)
   DISPATCH_LAYOUT_B(is_b_row_major, [&]() {
-    TORCH_CHECK(M % (a_chunk_signals.numel() * 128) == 0);
-    TORCH_CHECK(K % 64 == 0);
-    if (N <= 1280) {
+    auto conf = getenv("ASYNC_INPUT_MM_CONFIG");
+    if (std::string(conf) == "128_256_64_1_1_1") {
+      async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_1, _1, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "128_256_64_1_2_1") {
+      async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_1, _2, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "128_256_64_1_1_1") {
+      async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_1, _1, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "128_256_64_2_1_1") {
+      async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_2, _1, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "128_128_64_1_2_1") {
+      async_input_mm_impl<LayoutB, Shape<_128, _128, _64>, Shape<_1, _2, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "128_128_64_2_1_1") {
       async_input_mm_impl<LayoutB, Shape<_128, _128, _64>, Shape<_2, _1, _1>>(
           a, b, a_chunk_signals, a_chunk_pivot, out);
-    } else if (N <= 2816) {
-      if (M <= 8704) {
-        async_input_mm_impl<LayoutB, Shape<_128, _128, _64>, Shape<_2, _1, _1>>(
-            a, b, a_chunk_signals, a_chunk_pivot, out);
-      } else {
-        async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_2, _1, _1>>(
-            a, b, a_chunk_signals, a_chunk_pivot, out);
-      }
+    } else if (std::string(conf) == "256_128_64_1_1_1") {
+      async_input_mm_impl<LayoutB, Shape<_256, _128, _64>, Shape<_1, _1, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "256_128_64_1_2_1") {
+      async_input_mm_impl<LayoutB, Shape<_256, _128, _64>, Shape<_1, _2, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
+    } else if (std::string(conf) == "256_128_64_2_1_1") {
+      async_input_mm_impl<LayoutB, Shape<_256, _128, _64>, Shape<_2, _1, _1>>(
+          a, b, a_chunk_signals, a_chunk_pivot, out);
     } else {
-        async_input_mm_impl<LayoutB, Shape<_128, _256, _64>, Shape<_2, _1, _1>>(
-            a, b, a_chunk_signals, a_chunk_pivot, out);
+      throw std::runtime_error(conf);
     }
-  });
 #else
   TORCH_CHECK(
       false, "async_input_mm is not currenlty supported on your device");
