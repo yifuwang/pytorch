@@ -296,15 +296,27 @@ __global__ void nvshmem_all_reduce_kernel(
       const int split_idx = (rank + world_size - 1) % world_size;
       const size_t split_begin = split_idx * split_size;
       const size_t chunk_begin = split_begin + blockIdx.x * chunk_size;
+      constexpr int msg_size = 1024; // 65536;
 
-      nvshmem_int_put_signal_nbi(
-          output_ptr + chunk_begin,
-          input_ptr + chunk_begin,
-          chunk_size,
-          &split_signals[split_idx],
-          1,
-          NVSHMEM_SIGNAL_SET,
-          next_global_rank);
+      for (int off = 0; off < chunk_size; off+=msg_size) {
+        if (off + msg_size < chunk_size) {
+          nvshmem_int_put_nbi(
+              output_ptr + chunk_begin + off,
+              input_ptr + chunk_begin + off,
+              msg_size,
+              next_global_rank);
+        } else {
+          nvshmem_fence();
+          nvshmem_int_put_signal_nbi(
+              output_ptr + chunk_begin + off,
+              input_ptr + chunk_begin + off,
+              msg_size,
+              &split_signals[split_idx],
+              1,
+              NVSHMEM_SIGNAL_SET,
+              next_global_rank);
+        }
+      }
     }
 
     int received = 0, forwarded = 1;
