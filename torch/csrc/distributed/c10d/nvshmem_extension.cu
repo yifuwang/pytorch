@@ -111,44 +111,45 @@ void* nvshmem_ptr(const void* dest, int pe) {
   return ::nvshmem_ptr(dest, pe);
 }
 
-__global__ void ring_bcast(int* data, size_t nelem, int root, uint64_t* psync) {
-  int mype = nvshmem_my_pe();
-  int npes = nvshmem_n_pes();
-  int peer = (mype + 1) % npes;
+std::unordered_map<std::string, nvshmem_team_t> group_name_to_team_;
 
-  if (mype == root)
-    *psync = 1;
+nvshmem_team_t group_to_team(
+    const std::string& group_name,
+    const std::vector<int>& global_ranks) {
+  auto it = group_name_to_team_.find(group_name);
+  if (it != group_name_to_team_.end()) {
+    return it->second;
+  }
+  TORCH_CHECK(global_ranks.size() > 1);
+  int stride = global_ranks[1] - global_ranks[0];
+  for (size_t r = 1; r < global_ranks.size(); ++r) {
+    TORCH_CHECK(global_ranks[r] - global_ranks[r - 1] == stride);
+  }
 
-  nvshmem_signal_wait_until(psync, NVSHMEM_CMP_NE, 0);
-
-  if (mype == npes - 1)
-    return;
-
-  nvshmem_int_put(data, data, nelem, peer);
-  nvshmem_fence();
-  nvshmemx_signal_op(psync, 1, NVSHMEM_SIGNAL_SET, peer);
-
-  *psync = 0;
+  nvshmem_team_t team;
+  TORCH_CHECK(
+      nvshmem_team_split_strided(
+          NVSHMEM_TEAM_WORLD,
+          global_ranks[0],
+          stride,
+          global_ranks.size(),
+          nullptr,
+          0,
+          &team) == 0);
+  group_name_to_team_[group_name] = team;
+  TORCH_CHECK(team != NVSHMEM_TEAM_INVALID);
+  return team;
 }
 
-at::Tensor nvshmem_hello(at::Tensor& input) {
-  auto symm_mem = c10d::symmetric_memory::rendezvous(input, "0");
-  int rank = symm_mem->get_rank();
-  int world_size = symm_mem->get_world_size();
+at::Tensor nvshmem_broadcast(at::Tensor& input, const std::string& group_name) {
+  auto input_hdl = c10d::symmetric_memory::rendezvous(input, group_name);
+  int rank = input_hdl->get_rank();
+  int world_size = input_hdl->get_world_size();
+  auto team = group_to_team(group_name, input_hdl->get_rank_to_global_rank());
+  void* buffer_ptr = input_hdl->get_buffer_ptrs()[rank];
 
-  void* buffer_ptr = symm_mem->get_buffer_ptrs()[rank];
-  void* signal_pad_ptr = symm_mem->get_signal_pad_ptrs()[rank];
-  size_t buffer_size = symm_mem->get_buffer_size();
-  int root = 0;
-  void* args[] = {&buffer_ptr, &buffer_size, &root, &signal_pad_ptr};
-
-  dim3 grid_dim(1), block_dim(1);
   auto stream = at::cuda::getCurrentCUDAStream();
-  nvshmemx_barrier_all_on_stream(stream);
-  nvshmemx_collective_launch(
-      (const void*)ring_bcast, grid_dim, block_dim, args, 0, stream);
-  nvshmemx_barrier_all_on_stream(stream);
-
+  nvshmemx_broadcastmem_on_stream(team, buffer_ptr, buffer_ptr, input_hdl->get_buffer_size(), 0, stream);
   return input;
 }
 
@@ -265,8 +266,9 @@ __global__ void nvshmem_all_reduce_kernel(
     uint64_t* signal_pad_ptr,
     int rank,
     int world_size,
-    int* rank_to_global_rank) {
-  __shared__ ring_buf<int, 8> acc_queue;
+    int* rank_to_global_rank,
+    nvshmem_team_t team) {
+  __shared__ ring_buf<int, 128> acc_queue;
   __shared__ int acc_split_idx;
 
   if (threadIdx.x == 0) {
@@ -296,33 +298,18 @@ __global__ void nvshmem_all_reduce_kernel(
       const int split_idx = (rank + world_size - 1) % world_size;
       const size_t split_begin = split_idx * split_size;
       const size_t chunk_begin = split_begin + blockIdx.x * chunk_size;
-      constexpr int msg_size = 1024; // 65536;
-
-      for (int off = 0; off < chunk_size; off+=msg_size) {
-        if (off + msg_size < chunk_size) {
-          nvshmem_int_put_nbi(
-              output_ptr + chunk_begin + off,
-              input_ptr + chunk_begin + off,
-              msg_size,
-              next_global_rank);
-        } else {
-          nvshmem_fence();
-          nvshmem_int_put_signal_nbi(
-              output_ptr + chunk_begin + off,
-              input_ptr + chunk_begin + off,
-              msg_size,
-              &split_signals[split_idx],
-              1,
-              NVSHMEM_SIGNAL_SET,
-              next_global_rank);
-        }
-      }
+      nvshmem_int_put_signal_nbi(
+          output_ptr + chunk_begin,
+          input_ptr + chunk_begin,
+          chunk_size,
+          &split_signals[split_idx],
+          1,
+          NVSHMEM_SIGNAL_SET,
+          next_global_rank);
     }
 
     int received = 0, forwarded = 1;
     while (true) {
-      // Poll for received. For any received split, we enqueue a task for the
-      // reduction warp.
       for (int split_idx = 0;
            split_idx < world_size && received != world_size - 1;
            ++split_idx) {
@@ -375,21 +362,19 @@ __global__ void nvshmem_all_reduce_kernel(
       const size_t split_begin = split_idx * split_size;
       const size_t chunk_begin = split_begin + blockIdx.x * chunk_size;
 
-      for (size_t offset = chunk_begin;
-           offset < std::min(chunk_begin + chunk_size, numel);
-           offset += num_threads) {
-        if (offset + thread_idx < numel) {
-          output_ptr[offset + thread_idx] =
-              output_ptr[offset + thread_idx] + input_ptr[offset + thread_idx];
-        }
-      }
+      // for (size_t offset = chunk_begin;
+      //      offset < std::min(chunk_begin + chunk_size, numel);
+      //      offset += num_threads) {
+      //   if (offset + thread_idx < numel) {
+      //     output_ptr[offset + thread_idx] =
+      //         output_ptr[offset + thread_idx] + input_ptr[offset + thread_idx];
+      //   }
+      // }
       asm volatile("bar.sync 0, 512;" : : : "memory");
 
       if (thread_idx == 0) {
         if (split_idx != rank) {
           split_signals[split_idx] = 2;
-        } else {
-          // put in broadcast queue
         }
       }
     }
@@ -404,6 +389,7 @@ at::Tensor nvshmem_reduce_scatter_out(
   auto out_hdl = c10d::symmetric_memory::rendezvous(out, group_name);
   int rank = input_hdl->get_rank();
   int world_size = input_hdl->get_world_size();
+  auto team = group_to_team(group_name, input_hdl->get_rank_to_global_rank());
 
   void* input_ptr = input_hdl->get_buffer_ptrs()[rank];
   void* output_ptr = out_hdl->get_buffer_ptrs()[rank];
@@ -417,11 +403,12 @@ at::Tensor nvshmem_reduce_scatter_out(
       &signal_pad_ptr,
       &rank,
       &world_size,
-      &rank_to_global_rank};
+      &rank_to_global_rank,
+      &team};
 
-  dim3 grid_dim(8), block_dim(544);
+  dim3 grid_dim(32), block_dim(544);
   auto stream = at::cuda::getCurrentCUDAStream();
-  nvshmemx_barrier_all_on_stream(stream);
+  nvshmemx_barrier_on_stream(team, stream);
   nvshmemx_collective_launch(
       (const void*)nvshmem_all_reduce_kernel<int, true>,
       grid_dim,
@@ -429,7 +416,7 @@ at::Tensor nvshmem_reduce_scatter_out(
       args,
       0,
       stream);
-  nvshmemx_barrier_all_on_stream(stream);
+  nvshmemx_barrier_on_stream(team, stream);
   return out;
 }
 
